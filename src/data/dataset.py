@@ -3,14 +3,21 @@ import logging
 import os
 from typing import Any
 
-import pandas as pd
-import polars as pl
-import torch
-
 logger = logging.getLogger(__name__)
 
+# Heavy deps (torch, pandas, polars) are used by training-time code paths but
+# are not strictly required to use the Dataset wrapper / metric helpers in
+# unit tests or lean inference environments. Make the torch base class
+# optional: when torch is available we honour it (so DataLoader integration
+# still works); otherwise Dataset becomes a plain Python class.
+try:
+    import torch as _torch  # noqa: F401
+    _DATASET_BASE = _torch.utils.data.Dataset
+except ImportError:  # pragma: no cover - exercised in lean envs
+    _DATASET_BASE = object
 
-class Dataset(torch.utils.data.Dataset):
+
+class Dataset(_DATASET_BASE):
     """A class representing a dataset."""
 
     def __init__(self, data: list[dict[str, Any]], name: str | None = None, split: str | None = None):
@@ -114,8 +121,10 @@ class Dataset(torch.utils.data.Dataset):
                 for line in f:
                     data.append(json.loads(line))
         elif file_ext == ".csv":
+            import pandas as pd
             data = pd.read_csv(path).to_dict("records")
         elif file_ext == ".parquet":
+            import pandas as pd
             data = pd.read_parquet(path).to_dict("records")
         else:
             raise ValueError(f"Unsupported file format: {file_ext}")
@@ -176,6 +185,7 @@ class DatasetRegistry:
         dataset_dir = os.path.join(cls._DATASET_DIR, name)
         os.makedirs(dataset_dir, exist_ok=True)
 
+        import pandas as pd
         # Convert HuggingFace dataset to list of dictionaries if needed
         if hasattr(data, "to_pandas") and callable(data.to_pandas):
             # This is likely a HuggingFace dataset
@@ -239,6 +249,7 @@ class DatasetRegistry:
             logger.warning(f"Dataset file not found: {dataset_path}")
             return None
 
+        import polars as pl
         data = pl.read_parquet(dataset_path).to_dicts()
 
         logger.info(f"Loaded dataset '{name}' split '{split}' with {len(data)} examples.")

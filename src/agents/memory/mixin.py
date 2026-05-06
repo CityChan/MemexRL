@@ -68,6 +68,16 @@ class MemoryAgentMixin:
         self.compression_mode = compression_mode
         self.context_length_threshold = context_length_threshold
         self.auto_compress_prompt = auto_compress_prompt
+        # In graph_db mode, retrieval (QueryGraph + ReadExperience) is the
+        # primary tool surface — disabling it would make the prompt advertise
+        # tools that runtime would refuse, leaving the policy stranded. Force
+        # disable_retrieve=False here so prompt and execution stay consistent.
+        if compression_mode == "graph_db" and disable_retrieve:
+            logger.warning(
+                "disable_retrieve=True is incompatible with compression_mode='graph_db' "
+                "(QueryGraph is the primary retrieval surface). Forcing disable_retrieve=False."
+            )
+            disable_retrieve = False
         self.disable_retrieve = disable_retrieve
         self.max_summary_tokens = max_summary_tokens
 
@@ -92,6 +102,12 @@ class MemoryAgentMixin:
             else:
                 from src.database.context_database import create_context_database
                 self.context_db = create_context_database(backend="memory")
+        elif compression_mode == "graph_db":
+            if context_db is not None:
+                self.context_db = context_db
+            else:
+                from src.database.context_database import create_context_database
+                self.context_db = create_context_database(backend="graph")
         else:
             self.context_db = None
 
@@ -109,14 +125,14 @@ class MemoryAgentMixin:
 
     def is_memory_tool(self, tool_name: str) -> bool:
         """Check if a tool name is a memory tool."""
-        return tool_name in ("CompressExperience", "ReadExperience")
+        return tool_name in ("CompressExperience", "ReadExperience", "QueryGraph")
 
     def execute_memory_tool(self, tool_name: str, params: dict) -> MemoryToolResult:
         """
         Execute a memory tool. Called by environment like any other tool.
 
         Args:
-            tool_name: "CompressExperience" or "ReadExperience"
+            tool_name: "CompressExperience", "ReadExperience", or "QueryGraph"
             params: Tool parameters dict
 
         Returns:
@@ -126,6 +142,8 @@ class MemoryAgentMixin:
             return self._execute_compress(params)
         elif tool_name == "ReadExperience":
             return self._execute_retrieve(params)
+        elif tool_name == "QueryGraph":
+            return self._execute_graph_query(params)
         else:
             return MemoryToolResult(
                 success=False,
@@ -172,7 +190,7 @@ class MemoryAgentMixin:
         if self.compression_mode == "rag":
             return self._do_rag_compress(summary)
 
-        # === Lossless mode: validate db_blocks ===
+        # === Lossless / graph mode: validate db_blocks (same shape) ===
         db_blocks_raw = params.get("db_blocks")
         if db_blocks_raw is None:
             return MemoryToolResult(
@@ -220,7 +238,11 @@ class MemoryAgentMixin:
             )
 
         # === Validate and resolve each block ===
-        validated_blocks: list[tuple[str, str]] = []
+        # Each entry: (db_index, db_content, graph_fields_dict).
+        # graph_fields_dict is empty unless compression_mode == "graph_db"; when
+        # set it carries optional 'entity' / 'entities' / 'relations' that the
+        # GraphContextDatabase will use to build the typed-edge index.
+        validated_blocks: list[tuple[str, str, dict]] = []
         seen_indices: set[str] = set()
 
         # Build anchor source for extraction
@@ -302,7 +324,6 @@ class MemoryAgentMixin:
                         final_content = f"{db_content}\n\n{extracted}"
                 else:
                     final_content = extracted
-                validated_blocks.append((db_index, final_content))
             else:
                 # No anchors, must have db_content
                 if not db_content.strip():
@@ -311,7 +332,18 @@ class MemoryAgentMixin:
                         message=f"Error: db_blocks[{i}] needs 'db_content' or anchors",
                         tool_name="CompressExperience"
                     )
-                validated_blocks.append((db_index, db_content))
+                final_content = db_content
+
+            # Parse optional graph fields (only when in graph_db mode).
+            # All fields are optional: blocks without entity/relations behave
+            # like flat lossless_db entries.
+            graph_fields: dict = {}
+            if self.compression_mode == "graph_db":
+                graph_fields = self._parse_graph_fields(block, block_index=i)
+                if isinstance(graph_fields, MemoryToolResult):
+                    return graph_fields  # validation error
+
+            validated_blocks.append((db_index, final_content, graph_fields))
 
         # === Execute compression ===
         return self._do_lossless_compress(summary, validated_blocks)
@@ -319,27 +351,36 @@ class MemoryAgentMixin:
     def _do_lossless_compress(
         self,
         summary: str,
-        blocks: list[tuple[str, str]],
+        blocks: list[tuple[str, str, dict]],
     ) -> MemoryToolResult:
-        """Execute lossless compression with validated blocks."""
+        """Execute lossless compression with validated blocks.
+
+        Each block is (db_index, db_content, graph_fields). graph_fields is
+        an empty dict in lossless_db mode and may carry 'entity'/'entities'/
+        'relations' in graph_db mode; the GraphContextDatabase reads those to
+        build its typed-edge index.
+        """
         messages = getattr(self, 'messages', [])
         messages_to_compress = messages[2:]
         original_chars = sum(len(str(m.get('content', ''))) for m in messages_to_compress)
 
         # Store in database
         if self.context_db is not None:
-            for db_index, db_content in blocks:
-                self.context_db.store(db_index, {
+            for db_index, db_content, graph_fields in blocks:
+                value = {
                     'db_content': db_content,
                     'summary': summary,
                     'original_chars': original_chars,
                     'message_count': len(messages_to_compress),
-                })
+                }
+                if graph_fields:
+                    value.update(graph_fields)
+                self.context_db.store(db_index, value)
 
         # Update statistics
         self.compression_count += 1
         self.total_chars_compressed += original_chars
-        created_indices = [idx for idx, _ in blocks]
+        created_indices = [b[0] for b in blocks]
         self.db_indices.extend(created_indices)
 
         # Enforce max summary length (in tokens, approx 4 chars/token).
@@ -647,6 +688,250 @@ class MemoryAgentMixin:
         )
 
     # =========================================================================
+    # QueryGraph Implementation (graph_db mode only)
+    # =========================================================================
+
+    def _execute_graph_query(self, params: dict) -> MemoryToolResult:
+        """
+        Execute QueryGraph against the GraphContextDatabase.
+
+        Returns a focus-centered subgraph (entities + edges) rendered as
+        text that can be appended to the conversation. The agent can then
+        call ReadExperience(db_index) on any returned node for full content.
+
+        Expected params:
+            focus: str (required) - entity name OR db_index to anchor BFS
+            hops: int (optional, default 1, capped at 4)
+            budget: int (optional, default 2000) - max chars of preview content
+            edge_types: list[str] (optional) - filter to these edge types
+        """
+        if self.disable_retrieve:
+            return MemoryToolResult(
+                success=False,
+                message="Error: QueryGraph disabled (retrieval disabled in this mode)",
+                tool_name="QueryGraph"
+            )
+
+        if self.compression_mode != "graph_db":
+            return MemoryToolResult(
+                success=False,
+                message=(
+                    "Error: QueryGraph requires compression_mode='graph_db'. "
+                    f"Current mode is '{self.compression_mode}'."
+                ),
+                tool_name="QueryGraph"
+            )
+
+        if self.context_db is None:
+            return MemoryToolResult(
+                success=False,
+                message="Error: Graph context database not initialized",
+                tool_name="QueryGraph"
+            )
+
+        if not hasattr(self.context_db, "query_subgraph"):
+            return MemoryToolResult(
+                success=False,
+                message="Error: Configured context database is not graph-capable",
+                tool_name="QueryGraph"
+            )
+
+        focus = params.get("focus", "")
+        if not isinstance(focus, str) or not focus.strip():
+            return MemoryToolResult(
+                success=False,
+                message="Error: QueryGraph requires 'focus' (entity name or db_index)",
+                tool_name="QueryGraph"
+            )
+        focus = focus.strip()
+
+        hops_raw = params.get("hops", 1)
+        try:
+            hops = int(hops_raw)
+        except (TypeError, ValueError):
+            return MemoryToolResult(
+                success=False,
+                message=f"Error: 'hops' must be int, got {hops_raw!r}",
+                tool_name="QueryGraph"
+            )
+        # Cap hops to keep responses bounded.
+        hops = max(0, min(hops, 4))
+
+        budget_raw = params.get("budget", 2000)
+        try:
+            budget = int(budget_raw)
+        except (TypeError, ValueError):
+            return MemoryToolResult(
+                success=False,
+                message=f"Error: 'budget' must be int, got {budget_raw!r}",
+                tool_name="QueryGraph"
+            )
+        budget = max(200, min(budget, 8000))
+
+        edge_types = params.get("edge_types")
+        if edge_types is not None and not isinstance(edge_types, list):
+            return MemoryToolResult(
+                success=False,
+                message="Error: 'edge_types' must be a list of strings",
+                tool_name="QueryGraph"
+            )
+        if isinstance(edge_types, list):
+            edge_types = [t for t in edge_types if isinstance(t, str) and t.strip()]
+            if not edge_types:
+                edge_types = None
+
+        try:
+            result = self.context_db.query_subgraph(
+                focus=focus,
+                hops=hops,
+                budget_chars=budget,
+                edge_types=edge_types,
+            )
+        except Exception as e:
+            return MemoryToolResult(
+                success=False,
+                message=f"Error: QueryGraph failed: {e}",
+                tool_name="QueryGraph"
+            )
+
+        self.retrieval_count += 1
+
+        if result.get("missing"):
+            available = self.context_db.list_entities() if hasattr(self.context_db, "list_entities") else []
+            shown = ", ".join(available[:20]) if available else "none"
+            more = f" (+{len(available) - 20} more)" if len(available) > 20 else ""
+            return MemoryToolResult(
+                success=False,
+                message=f"Error: focus '{focus}' not found in graph. Known entities: {shown}{more}",
+                tool_name="QueryGraph"
+            )
+
+        rendered = self._render_subgraph(result, hops=hops)
+        return MemoryToolResult(
+            success=True,
+            message=rendered,
+            tool_name="QueryGraph"
+        )
+
+    def _parse_graph_fields(self, block: dict, block_index: int):
+        """Validate and normalize graph fields on a single db_block.
+
+        Returns a dict with any of {entity, entities, relations} keys, or a
+        MemoryToolResult on validation failure (so the caller can short-
+        circuit). All graph fields are optional.
+        """
+        out: dict = {}
+
+        ent = block.get("entity")
+        if ent is not None:
+            if not isinstance(ent, str) or not ent.strip():
+                return MemoryToolResult(
+                    success=False,
+                    message=f"Error: db_blocks[{block_index}] 'entity' must be non-empty string",
+                    tool_name="CompressExperience"
+                )
+            out["entity"] = ent.strip()
+
+        extras = block.get("entities")
+        if extras is not None:
+            if not isinstance(extras, list):
+                return MemoryToolResult(
+                    success=False,
+                    message=f"Error: db_blocks[{block_index}] 'entities' must be a list of strings",
+                    tool_name="CompressExperience"
+                )
+            cleaned = [e.strip() for e in extras if isinstance(e, str) and e.strip()]
+            if cleaned:
+                out["entities"] = cleaned
+
+        rels = block.get("relations")
+        if rels is not None:
+            if not isinstance(rels, list):
+                return MemoryToolResult(
+                    success=False,
+                    message=f"Error: db_blocks[{block_index}] 'relations' must be a list of objects",
+                    tool_name="CompressExperience"
+                )
+            cleaned_rels: list[dict] = []
+            for j, r in enumerate(rels):
+                if not isinstance(r, dict):
+                    return MemoryToolResult(
+                        success=False,
+                        message=f"Error: db_blocks[{block_index}] relations[{j}] must be an object",
+                        tool_name="CompressExperience"
+                    )
+                rt = r.get("type")
+                tgt = r.get("target")
+                if not (isinstance(rt, str) and rt.strip()):
+                    return MemoryToolResult(
+                        success=False,
+                        message=f"Error: db_blocks[{block_index}] relations[{j}] missing 'type'",
+                        tool_name="CompressExperience"
+                    )
+                if not (isinstance(tgt, str) and tgt.strip()):
+                    return MemoryToolResult(
+                        success=False,
+                        message=f"Error: db_blocks[{block_index}] relations[{j}] missing 'target'",
+                        tool_name="CompressExperience"
+                    )
+                entry = {"type": rt.strip(), "target": tgt.strip()}
+                src = r.get("source")
+                if src is not None:
+                    if not (isinstance(src, str) and src.strip()):
+                        return MemoryToolResult(
+                            success=False,
+                            message=f"Error: db_blocks[{block_index}] relations[{j}] 'source' must be non-empty string",
+                            tool_name="CompressExperience"
+                        )
+                    entry["source"] = src.strip()
+                cleaned_rels.append(entry)
+            if cleaned_rels:
+                out["relations"] = cleaned_rels
+
+        return out
+
+    @staticmethod
+    def _render_subgraph(result: dict, hops: int) -> str:
+        """Format a query_subgraph result as a text block for the agent."""
+        focus = result.get("focus", "?")
+        entities = result.get("entities", [])
+        edges = result.get("edges", [])
+        truncated = result.get("truncated", False)
+
+        lines = [
+            f"=== Subgraph centered on \"{focus}\" "
+            f"(hops={hops}, {len(entities)} entities, {len(edges)} edges"
+            f"{', content truncated' if truncated else ''}) ==="
+        ]
+
+        if entities:
+            lines.append("\nEntities:")
+            for ent in entities:
+                name = ent.get("entity", "?")
+                depth = ent.get("depth", "?")
+                idxs = ent.get("db_indices", []) or []
+                idx_str = ", ".join(idxs) if idxs else "(no stored block)"
+                lines.append(f"- {name} [depth {depth}] (db_indices: {idx_str})")
+                preview = ent.get("content_preview", "")
+                if preview:
+                    indented = "\n".join("    " + ln for ln in preview.splitlines())
+                    lines.append(indented)
+
+        if edges:
+            lines.append("\nEdges:")
+            for edge in edges:
+                # edge is (src, rel_type, tgt, source_key)
+                if len(edge) >= 3:
+                    src, rel_type, tgt = edge[0], edge[1], edge[2]
+                    lines.append(f"- {src} --{rel_type}--> {tgt}")
+
+        lines.append(
+            "\n[Tip: call ReadExperience(db_index) for the full content of any node, "
+            "or QueryGraph(focus=<entity>, hops=N) to expand further.]"
+        )
+        return "\n".join(lines)
+
+    # =========================================================================
     # Helpers
     # =========================================================================
 
@@ -776,7 +1061,7 @@ class MemoryAgentMixin:
         """
         # Inject context status BEFORE calling super() so trajectory records it
         compression_mode = getattr(self, 'compression_mode', 'none')
-        if not done and compression_mode in ("lossless_db", "lossy", "rag"):
+        if not done and compression_mode in ("lossless_db", "lossy", "rag", "graph_db"):
             context_status = self.get_context_status()
             observation = str(observation) + context_status
 
@@ -824,6 +1109,20 @@ class MemoryAgentMixin:
         if self.db_indices:
             status += f"\n[Available indices: {', '.join(self.db_indices)}]"
             status += f"\n[Read your summary's index map and call ReadExperience(db_index) to retrieve what you need]"
+
+        # In graph mode, also show indexed entities so the agent can call
+        # QueryGraph(focus=<entity>) without guessing the namespace.
+        if (
+            getattr(self, 'compression_mode', '') == "graph_db"
+            and self.context_db is not None
+            and hasattr(self.context_db, 'list_entities')
+        ):
+            entities = self.context_db.list_entities()
+            if entities:
+                shown = ', '.join(entities[:20])
+                more = f" (+{len(entities) - 20} more)" if len(entities) > 20 else ""
+                status += f"\n[Indexed entities: {shown}{more}]"
+                status += "\n[Call QueryGraph(focus=<entity>, hops=N) to retrieve a focus-centered subgraph]"
 
         # Add compression warnings if auto_compress_prompt is enabled
         if getattr(self, 'auto_compress_prompt', True):

@@ -32,6 +32,7 @@ from src.agents.memory import (
     get_memory_tools_prompt_full,
     get_memory_tools_prompt_compress_only,
     get_memory_tools_prompt_rag,
+    get_memory_tools_prompt_graph,
 )
 from src.parser.tool_parser import ParseResult
 from src.parser.tool_parser_qwen import QwenToolParser
@@ -332,9 +333,14 @@ class ToolAgentWithMemory(MemoryAgentMixin, ToolAgent):
         )
 
         # Build system prompt: base + memory_tools + tool_format_suffix
-        if compression_mode in ("lossless_db", "lossy", "rag"):
+        if compression_mode in ("lossless_db", "lossy", "rag", "graph_db"):
             if compression_mode == "rag":
                 memory_prompt = get_memory_tools_prompt_rag(tool_call_format)
+            elif compression_mode == "graph_db":
+                # Graph mode bundles compress + ReadExperience + QueryGraph in
+                # one prompt. init_memory() forces disable_retrieve=False in
+                # this mode (with a warning), so prompt and runtime agree.
+                memory_prompt = get_memory_tools_prompt_graph(tool_call_format)
             elif disable_retrieve:
                 memory_prompt = get_memory_tools_prompt_compress_only(tool_call_format)
             else:

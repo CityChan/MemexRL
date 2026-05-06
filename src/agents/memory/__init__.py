@@ -22,6 +22,7 @@ from .prompts import (
     get_memory_tools_prompt_full,
     get_memory_tools_prompt_compress_only,
     get_memory_tools_prompt_rag,
+    get_memory_tools_prompt_graph,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     "get_memory_tools_prompt_full",
     "get_memory_tools_prompt_compress_only",
     "get_memory_tools_prompt_rag",
+    "get_memory_tools_prompt_graph",
 ]

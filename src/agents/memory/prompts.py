@@ -319,6 +319,162 @@ Example:
 
 
 # =============================================================================
+# Graph DB Mode Prompts (Typed-edge memory: compress + read + graph query)
+# =============================================================================
+
+_GRAPH_SYSTEM_INTRO = '''
+=== CRITICAL: THREE OBJECTIVES (graph memory) ===
+
+You have THREE equally important goals:
+1. SOLVE THE TASK correctly
+2. KEEP working context UNDER the threshold (shown in [Context Status] after EVERY observation)
+3. BUILD A USEFUL MEMORY GRAPH so future steps can retrieve evidence by entity, not by recency
+
+SEVERE PENALTIES (can nullify your task success reward):
+- Context overflow: working > threshold receives a SEVERE PENALTY
+- Redundant tool calls: re-fetching information you already stored = SEVERE PENALTY
+- Missing graph structure: storing isolated blocks with no `entity` / `relations` defeats the purpose of graph memory
+
+MANDATORY PRACTICES:
+- Monitor [Context Status: working tokens=X, threshold=Z] after EVERY observation
+- When you compress, attach an `entity` (the primary subject of the block) and any
+  `relations` linking it to other entities. Edges are typed (e.g. "contains",
+  "located_in", "answer_of", "evidence_for"). Use whatever edge types fit your task.
+- After compression, call QueryGraph(focus=<entity>, hops=N) to retrieve a
+  focus-centered subgraph BEFORE re-running tools. Use ReadExperience(db_index)
+  for the full content of any single node returned by QueryGraph.
+
+CRITICAL - After compression:
+- Compressed messages are DELETED from context. The ONLY way back is QueryGraph or
+  ReadExperience. Re-running environment tools without checking the graph first is forbidden.
+'''
+
+_GRAPH_COMPRESS_DESC = '''–– BEGIN FUNCTION: CompressExperience ––
+Description:
+Compress working context into the typed-edge memory graph. Replaces all messages
+(except system prompt and task description) with your summary. Each db_block is a
+node in the graph; `entity` is its primary identifier; `relations` add typed edges
+to other entities (which may be other nodes you store now or in future compressions).
+
+Usage:
+  • Strongly recommended when working > 0.8 * threshold
+  • Exceeding threshold will result in penalty
+  • Always attach `entity` and (where applicable) `relations` so QueryGraph can find this block later
+  • When compressing again later: include any previously-known indices in your new summary's index map
+
+Parameters:
+  1. summary (string, required)
+     Index map listing ALL stored indices and key entities. Format:
+     - <db_index> [entity=<name>] - <what it contains>
+     End with current status and next steps.
+
+  2. db_blocks (array, required)
+     List of nodes to add to the graph. Per block:
+       • db_index (string, REQUIRED): Unique key, e.g. "obs_kitchen_001". 1-64 chars, [A-Za-z0-9_-]
+       • db_content (string, REQUIRED): Verbatim or summarized content for this node
+       • entity (string, OPTIONAL): Primary subject of the node. Strongly recommended -
+           without it, QueryGraph cannot find this node by name.
+       • entities (list[string], OPTIONAL): Additional entities mentioned in this block.
+           Listed entities can be used as `focus` in future QueryGraph calls.
+       • relations (list[object], OPTIONAL): Typed edges originating from this block.
+           Each relation: {"type": "<edge_type>", "target": "<entity>"}.
+           Optional "source": "<entity>" overrides the default source (block's `entity`).
+           Choose edge types that suit the task: "contains", "located_in", "answer_of",
+           "evidence_for", "subtask_of", "follows", "similar_to", "answers", ...
+
+  Anchor extraction (start_anchor / mid_anchor / end_anchor) is also supported,
+  identical to lossless mode; use it for verbatim spans of large outputs.
+'''
+
+_GRAPH_COMPRESS_EXAMPLE_XML = '''
+Example:
+<function=CompressExperience>
+<parameter=summary>Index map:
+- obs_kitchen_001 [entity=kitchen] - kitchen layout overview
+- obs_stove_002   [entity=stove]   - stove state and contents
+- obs_kettle_003  [entity=kettle]  - kettle state
+Status: identified target object (kettle), now need to put it on stove. Next: pick_up kettle.</parameter>
+<parameter=db_blocks>[
+  {
+    "db_index": "obs_kitchen_001",
+    "db_content": "Kitchen contains a stove (front-left) and a kettle on the counter.",
+    "entity": "kitchen",
+    "relations": [
+      {"type": "contains", "target": "stove"},
+      {"type": "contains", "target": "kettle"}
+    ]
+  },
+  {
+    "db_index": "obs_stove_002",
+    "db_content": "Black gas stove with four burners, currently empty.",
+    "entity": "stove",
+    "relations": [{"type": "located_in", "target": "kitchen"}]
+  },
+  {
+    "db_index": "obs_kettle_003",
+    "db_content": "Stainless-steel kettle, empty, sitting on the counter beside the stove.",
+    "entity": "kettle",
+    "relations": [
+      {"type": "located_in", "target": "kitchen"},
+      {"type": "near", "target": "stove"}
+    ]
+  }
+]</parameter>
+</function>
+
+–– END FUNCTION ––
+'''
+
+_GRAPH_COMPRESS_EXAMPLE_QWEN = '''
+Example:
+<tool_call>
+{"name": "CompressExperience", "arguments": {"summary": "Index map:\\n- obs_kitchen_001 [entity=kitchen] - kitchen layout\\n- obs_stove_002 [entity=stove] - stove state\\n- obs_kettle_003 [entity=kettle] - kettle state\\nStatus: need to put kettle on stove. Next: pick_up kettle.", "db_blocks": [{"db_index": "obs_kitchen_001", "db_content": "Kitchen contains a stove and a kettle on the counter.", "entity": "kitchen", "relations": [{"type": "contains", "target": "stove"}, {"type": "contains", "target": "kettle"}]}, {"db_index": "obs_stove_002", "db_content": "Black gas stove, empty.", "entity": "stove", "relations": [{"type": "located_in", "target": "kitchen"}]}, {"db_index": "obs_kettle_003", "db_content": "Stainless-steel kettle on the counter.", "entity": "kettle", "relations": [{"type": "located_in", "target": "kitchen"}, {"type": "near", "target": "stove"}]}]}}
+</tool_call>
+
+–– END FUNCTION ––
+'''
+
+_GRAPH_QUERY_DESC = '''
+–– BEGIN FUNCTION: QueryGraph ––
+Description:
+Retrieve a focus-centered subgraph from the typed-edge memory. BFS from `focus`
+(an entity name OR a db_index) up to `hops` deep, returning the visited entities,
+their stored content previews, and the typed edges between them. Use this BEFORE
+re-running environment tools when you need to recall related context.
+
+Parameters:
+  1. focus (string, REQUIRED)
+     Entity name (preferred) or db_index. See [Indexed entities] in [Context Status].
+  2. hops (integer, OPTIONAL, default 1, max 4)
+     BFS depth. 0 = focus only; 1 = direct neighbours; higher = wider subgraph.
+  3. budget (integer, OPTIONAL, default 2000)
+     Max characters of preview content to include across all returned nodes.
+  4. edge_types (list[string], OPTIONAL)
+     Restrict traversal to these edge types only. Omit to traverse all edges.
+'''
+
+_GRAPH_QUERY_EXAMPLE_XML = '''
+Example:
+<function=QueryGraph>
+<parameter=focus>kitchen</parameter>
+<parameter=hops>2</parameter>
+<parameter=budget>2000</parameter>
+</function>
+
+–– END FUNCTION ––
+'''
+
+_GRAPH_QUERY_EXAMPLE_QWEN = '''
+Example:
+<tool_call>
+{"name": "QueryGraph", "arguments": {"focus": "kitchen", "hops": 2, "budget": 2000}}
+</tool_call>
+
+–– END FUNCTION ––
+'''
+
+
+# =============================================================================
 # Prompt Getter Functions
 # =============================================================================
 
@@ -347,3 +503,27 @@ def get_memory_tools_prompt_compress_only(tool_call_format: str | None = None) -
     else:
         # Default to XML format
         return _COMPRESS_ONLY_SYSTEM_INTRO + _COMPRESS_ONLY_DESC + _COMPRESS_ONLY_EXAMPLE_XML
+
+
+def get_memory_tools_prompt_graph(tool_call_format: str | None = None) -> str:
+    """Get graph-DB mode memory tools prompt (compress + read + query graph)."""
+    if tool_call_format == "qwen":
+        return (
+            _GRAPH_SYSTEM_INTRO
+            + _GRAPH_COMPRESS_DESC
+            + _GRAPH_COMPRESS_EXAMPLE_QWEN
+            + _READ_EXPERIENCE_DESC
+            + _READ_EXAMPLE_QWEN
+            + _GRAPH_QUERY_DESC
+            + _GRAPH_QUERY_EXAMPLE_QWEN
+        )
+    else:
+        return (
+            _GRAPH_SYSTEM_INTRO
+            + _GRAPH_COMPRESS_DESC
+            + _GRAPH_COMPRESS_EXAMPLE_XML
+            + _READ_EXPERIENCE_DESC
+            + _READ_EXAMPLE_XML
+            + _GRAPH_QUERY_DESC
+            + _GRAPH_QUERY_EXAMPLE_XML
+        )
