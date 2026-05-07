@@ -505,11 +505,36 @@ def get_memory_tools_prompt_compress_only(tool_call_format: str | None = None) -
         return _COMPRESS_ONLY_SYSTEM_INTRO + _COMPRESS_ONLY_DESC + _COMPRESS_ONLY_EXAMPLE_XML
 
 
-def get_memory_tools_prompt_graph(tool_call_format: str | None = None) -> str:
-    """Get graph-DB mode memory tools prompt (compress + read + query graph)."""
+def _format_edge_schema_clause(edge_schema) -> str:
+    """Render a closed edge-type vocabulary into the prompt, or empty string."""
+    if edge_schema is None:
+        return ""
+    types = sorted({t.strip().lower() for t in edge_schema if isinstance(t, str) and t.strip()})
+    if not types:
+        return ""
+    return (
+        "\nEDGE TYPE VOCABULARY (closed set — use ONLY these strings, lowercased):\n"
+        f"  {', '.join(types)}\n"
+        "Edges whose type is not in this list will be silently dropped from the graph.\n"
+    )
+
+
+def get_memory_tools_prompt_graph(
+    tool_call_format: str | None = None,
+    edge_schema=None,
+) -> str:
+    """Get graph-DB mode memory tools prompt (compress + read + query graph).
+
+    Args:
+        edge_schema: optional iterable of allowed edge type strings. When set,
+            the prompt advertises the closed vocabulary so the policy doesn't
+            have to invent edge labels.
+    """
+    schema_clause = _format_edge_schema_clause(edge_schema)
     if tool_call_format == "qwen":
         return (
             _GRAPH_SYSTEM_INTRO
+            + schema_clause
             + _GRAPH_COMPRESS_DESC
             + _GRAPH_COMPRESS_EXAMPLE_QWEN
             + _READ_EXPERIENCE_DESC
@@ -520,6 +545,7 @@ def get_memory_tools_prompt_graph(tool_call_format: str | None = None) -> str:
     else:
         return (
             _GRAPH_SYSTEM_INTRO
+            + schema_clause
             + _GRAPH_COMPRESS_DESC
             + _GRAPH_COMPRESS_EXAMPLE_XML
             + _READ_EXPERIENCE_DESC
@@ -527,3 +553,34 @@ def get_memory_tools_prompt_graph(tool_call_format: str | None = None) -> str:
             + _GRAPH_QUERY_DESC
             + _GRAPH_QUERY_EXAMPLE_XML
         )
+
+
+# Per-task preset edge schemas. Use these as starting points; refine as you
+# inspect actual policy behaviour. All types are lowercase.
+ALFWORLD_EDGE_SCHEMA: list[str] = [
+    "contains",      # room contains object / container holds object
+    "located_in",    # object located_in room
+    "on",            # object on surface
+    "in",            # object in container
+    "near",          # spatial proximity
+    "holds",         # agent holds object
+    "needs",         # object needs action (e.g. heating)
+    "goes_to",       # path/movement
+]
+
+HOTPOTQA_EDGE_SCHEMA: list[str] = [
+    "born_in",
+    "died_in",
+    "located_in",
+    "occupation",
+    "member_of",
+    "founded_by",
+    "authored",
+    "directed",
+    "produced",
+    "knows",
+    "spouse_of",
+    "child_of",
+    "evidence_for",
+    "answers",
+]

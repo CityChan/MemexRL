@@ -45,7 +45,15 @@ class GraphContextDatabase(ContextDatabase):
     store time. delete() removes the node and all incident edges.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, edge_schema: Optional[Iterable[str]] = None) -> None:
+        """Initialize the graph context database.
+
+        Args:
+            edge_schema: Optional closed-set vocabulary for edge types. When
+                provided, only edges whose `type` (lowercased) appears in the
+                schema are indexed; unknown types are soft-dropped and counted
+                in `_dropped_edge_count`. Pass None to keep open vocabulary.
+        """
         self._store: dict[str, dict] = {}
         # entity name -> set of db_indices that "own" this entity
         self._entity_to_keys: dict[str, set[str]] = defaultdict(set)
@@ -55,7 +63,18 @@ class GraphContextDatabase(ContextDatabase):
         self._reverse_adjacency: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
         # full ordered edge log: (src, rel, tgt, source_key)
         self._edges: list[tuple[str, str, str, str]] = []
-        logger.info("[GraphCtxDB] Using in-memory graph storage")
+        # Closed-vocabulary schema (lowercased). None = open vocabulary.
+        self._edge_schema: Optional[set[str]] = (
+            {t.strip().lower() for t in edge_schema if isinstance(t, str) and t.strip()}
+            if edge_schema is not None
+            else None
+        )
+        # Counts edges dropped due to schema mismatch (for telemetry / debugging).
+        self._dropped_edge_count: int = 0
+        logger.info(
+            "[GraphCtxDB] Using in-memory graph storage (edge_schema=%s)",
+            sorted(self._edge_schema) if self._edge_schema is not None else "open",
+        )
 
     # ------------------------------------------------------------------
     # ContextDatabase interface
@@ -112,16 +131,29 @@ class GraphContextDatabase(ContextDatabase):
         rel_type: str,
         tgt: str,
         source_key: str = "",
-    ) -> None:
+    ) -> bool:
         """Manually add an edge outside of the store() flow.
 
         Useful for cold-start heuristics that link existing nodes after
         compression (the mixin can call this when it detects similarity
         between newly-stored db_indices).
+
+        Returns:
+            True if the edge was added, False if it was rejected by the
+            edge_schema (when one is configured).
         """
-        self._edges.append((src, rel_type, tgt, source_key))
-        self._adjacency[src].append((rel_type, tgt, source_key))
-        self._reverse_adjacency[tgt].append((rel_type, src, source_key))
+        rel_type_norm = rel_type.strip().lower()
+        if self._edge_schema is not None and rel_type_norm not in self._edge_schema:
+            self._dropped_edge_count += 1
+            return False
+        # Ensure endpoints appear in the entity index so list_entities() can
+        # see entities introduced exclusively via add_edge (cold-start linker).
+        self._entity_to_keys.setdefault(src, set())
+        self._entity_to_keys.setdefault(tgt, set())
+        self._edges.append((src, rel_type_norm, tgt, source_key))
+        self._adjacency[src].append((rel_type_norm, tgt, source_key))
+        self._reverse_adjacency[tgt].append((rel_type_norm, src, source_key))
+        return True
 
     def query_subgraph(
         self,
@@ -161,7 +193,14 @@ class GraphContextDatabase(ContextDatabase):
               "missing": bool,           # True if focus had no node and no edges
             }
         """
-        edge_filter: Optional[set[str]] = set(edge_types) if edge_types else None
+        # Lowercase the filter so it matches the canonicalized edge types in
+        # the index (edges are stored lowercased).
+        edge_filter: Optional[set[str]] = (
+            {t.strip().lower() for t in edge_types if isinstance(t, str) and t.strip()}
+            if edge_types else None
+        )
+        if edge_filter is not None and not edge_filter:
+            edge_filter = None
 
         # Resolve focus: prefer entity; fall back to db_index -> entity lookup
         focus_entity = focus
@@ -257,6 +296,8 @@ class GraphContextDatabase(ContextDatabase):
             "entity_count": len(self._entity_to_keys),
             "edge_count": len(self._edges),
             "total_size_bytes": total_size,
+            "edge_schema": sorted(self._edge_schema) if self._edge_schema is not None else None,
+            "dropped_edge_count": self._dropped_edge_count,
         }
 
     # ------------------------------------------------------------------
@@ -295,7 +336,13 @@ class GraphContextDatabase(ContextDatabase):
                 continue
             if not (isinstance(tgt, str) and tgt.strip()):
                 continue
-            src, rel_type, tgt = src.strip(), rel_type.strip(), tgt.strip()
+            # Canonicalize: entity names keep original casing; edge types are
+            # lowercased so "contains" / "Contains" / "CONTAINS" merge.
+            src, tgt = src.strip(), tgt.strip()
+            rel_type = rel_type.strip().lower()
+            if self._edge_schema is not None and rel_type not in self._edge_schema:
+                self._dropped_edge_count += 1
+                continue
             self._edges.append((src, rel_type, tgt, key))
             self._adjacency[src].append((rel_type, tgt, key))
             self._reverse_adjacency[tgt].append((rel_type, src, key))

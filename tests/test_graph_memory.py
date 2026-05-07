@@ -187,6 +187,61 @@ class TestGraphContextDatabase(unittest.TestCase):
         self.assertEqual(s["entry_count"], 1)
         self.assertEqual(s["edge_count"], 1)
         self.assertGreaterEqual(s["entity_count"], 1)
+        self.assertIsNone(s["edge_schema"])
+        self.assertEqual(s["dropped_edge_count"], 0)
+
+    def test_edge_type_lowercase_canonicalization(self):
+        # "Contains" / "CONTAINS" / "contains" must merge into a single edge type.
+        self.db.store("k1", {
+            "db_content": "...", "entity": "X",
+            "relations": [
+                {"type": "Contains", "target": "Y"},
+                {"type": "CONTAINS", "target": "Z"},
+                {"type": "contains", "target": "W"},
+            ],
+        })
+        types = {e[1] for e in self.db._edges}
+        self.assertEqual(types, {"contains"})
+
+    def test_closed_edge_schema_drops_unknown_types(self):
+        db = GraphContextDatabase(edge_schema=["contains", "located_in"])
+        db.store("k1", {
+            "db_content": "...", "entity": "kitchen",
+            "relations": [
+                {"type": "contains", "target": "stove"},     # kept
+                {"type": "near", "target": "fridge"},          # dropped
+                {"type": "Located_in", "target": "house"},     # kept (case-folded)
+            ],
+        })
+        edge_types = {e[1] for e in db._edges}
+        self.assertEqual(edge_types, {"contains", "located_in"})
+        self.assertEqual(db._dropped_edge_count, 1)
+        self.assertEqual(db.get_stats()["dropped_edge_count"], 1)
+
+    def test_closed_schema_filters_query_edge_types_with_case_insensitivity(self):
+        db = GraphContextDatabase(edge_schema=["contains", "near"])
+        db.store("k1", {"db_content": "...", "entity": "X",
+                         "relations": [
+                             {"type": "contains", "target": "Y"},
+                             {"type": "near", "target": "Z"},
+                         ]})
+        # Caller passes uppercased filter — should still match
+        r = db.query_subgraph("X", hops=1, edge_types=["CONTAINS"])
+        ents = {e["entity"] for e in r["entities"]}
+        self.assertIn("Y", ents)
+        self.assertNotIn("Z", ents)
+
+    def test_add_edge_respects_schema_and_indexes_endpoints(self):
+        db = GraphContextDatabase(edge_schema=["link"])
+        # Allowed type → indexed; endpoints appear in entity index
+        self.assertTrue(db.add_edge("A", "Link", "B", source_key=""))
+        self.assertIn("A", db._entity_to_keys)
+        self.assertIn("B", db._entity_to_keys)
+        self.assertEqual(db._edges[0][1], "link")
+        # Disallowed type → rejected, dropped count increments
+        self.assertFalse(db.add_edge("A", "unknown", "C"))
+        self.assertEqual(db._dropped_edge_count, 1)
+        self.assertNotIn("C", db._entity_to_keys)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +429,32 @@ class TestMemoryAgentMixinGraphMode(unittest.TestCase):
                 self.init_memory(compression_mode="lossless_db", disable_retrieve=True)
         a = _Harness()
         self.assertTrue(a.disable_retrieve)
+
+    def test_init_memory_with_edge_schema_propagates_to_db(self):
+        class _Harness(MemoryAgentMixin):
+            def __init__(self):
+                self.token_manager = _StubTokenManager()
+                self.messages = []
+                self.step = 0
+                self.init_memory(
+                    compression_mode="graph_db",
+                    edge_schema=["contains", "near"],
+                )
+        a = _Harness()
+        self.assertEqual(a.context_db._edge_schema, {"contains", "near"})
+
+    def test_graph_prompt_includes_schema_when_set(self):
+        from src.agents.memory.prompts import get_memory_tools_prompt_graph
+        prompt = get_memory_tools_prompt_graph(
+            tool_call_format="xml",
+            edge_schema=["contains", "located_in"],
+        )
+        self.assertIn("EDGE TYPE VOCABULARY", prompt)
+        self.assertIn("contains", prompt)
+        self.assertIn("located_in", prompt)
+        # Without schema, no vocabulary clause
+        prompt_open = get_memory_tools_prompt_graph(tool_call_format="xml")
+        self.assertNotIn("EDGE TYPE VOCABULARY", prompt_open)
 
     def test_context_status_lists_entities_in_graph_mode(self):
         self.agent.execute_memory_tool("CompressExperience", {

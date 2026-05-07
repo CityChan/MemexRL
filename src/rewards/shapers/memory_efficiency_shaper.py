@@ -11,8 +11,13 @@ from src.rewards.reward_shaper import RewardShaper
 
 logger = logging.getLogger(__name__)
 
-# Tools to exclude from penalty calculations (memory management tools)
-MEMORY_TOOLS = frozenset({'CompressExperience', 'ReadExperience'})
+# Tools to exclude from redundancy / utility-downstream calculations.
+# QueryGraph is a memory tool (graph_db mode); same exclusion semantics apply.
+MEMORY_TOOLS = frozenset({'CompressExperience', 'ReadExperience', 'QueryGraph'})
+
+# Subset that is *retrieval* (i.e. the calls whose downstream usefulness we
+# want to reward). CompressExperience writes; the others read.
+RETRIEVAL_TOOLS = frozenset({'ReadExperience', 'QueryGraph'})
 
 # State-modifying file_editor commands
 STATE_MODIFYING_COMMANDS = frozenset({'str_replace', 'insert', 'create'})
@@ -41,10 +46,15 @@ class MemoryEfficiencyShaper(RewardShaper):
         lambda_ctx (float): Context overflow penalty weight (default: 0.5)
         lambda_red (float): Redundant tool call penalty weight (default: 0.3)
         lambda_format (float): Format error penalty weight (default: 0.2)
+        lambda_util (float): Retrieval utility BONUS weight (default: 0.2)
         context_threshold (int): Working context threshold in tokens (default: 8000)
+        util_window_steps (int): How many steps after a retrieval to scan for
+            evidence of use (default: 5)
         enable_context_penalty (bool): Enable context overflow penalty (default: True)
         enable_redundancy_penalty (bool): Enable redundant tool penalty (default: True)
         enable_format_penalty (bool): Enable format error penalty (default: True)
+        enable_utility_reward (bool): Enable retrieval-utility bonus (default: False)
+            Off by default to keep base shaper bit-identical for non-graph runs.
     """
 
     def __init__(self, config: dict):
@@ -57,10 +67,13 @@ class MemoryEfficiencyShaper(RewardShaper):
         self.lambda_ctx = config.get('lambda_ctx', 0.5)
         self.lambda_red = config.get('lambda_red', 0.3)
         self.lambda_format = config.get('lambda_format', 0.2)
+        self.lambda_util = config.get('lambda_util', 0.2)
         self.threshold = config.get('context_threshold', 8000)
+        self.util_window_steps = config.get('util_window_steps', 5)
         self.enable_context_penalty = config.get('enable_context_penalty', True)
         self.enable_redundancy_penalty = config.get('enable_redundancy_penalty', True)
         self.enable_format_penalty = config.get('enable_format_penalty', True)
+        self.enable_utility_reward = config.get('enable_utility_reward', False)
 
     def shape(
         self,
@@ -106,6 +119,13 @@ class MemoryEfficiencyShaper(RewardShaper):
             fmt_penalty, fmt_info = self._compute_format_penalty(trajectory)
             total_penalty += fmt_penalty
             penalty_info['penalties']['format_errors'] = fmt_info
+
+        # 4. Retrieval utility bonus (positive shaping for graph_db / lossless_db
+        # modes). Off by default so the baseline shaper is unchanged.
+        if self.enable_utility_reward:
+            util_bonus, util_info = self._compute_retrieval_utility_reward(trajectory)
+            total_penalty += util_bonus  # positive value, treated uniformly
+            penalty_info['penalties']['retrieval_utility'] = util_info
 
         # Compute shaped reward
         shaped_reward = base_reward + total_penalty
@@ -276,4 +296,97 @@ class MemoryEfficiencyShaper(RewardShaper):
             'steps_with_errors': len(steps_with_errors),
             'total_tool_attempts': total_attempts,
             'format_error_ratio': ratio,
+        }
+
+    def _compute_retrieval_utility_reward(self, trajectory: Trajectory) -> tuple[float, dict]:
+        """Reward retrievals (ReadExperience / QueryGraph) that are USED downstream.
+
+        Definition of "used" for a retrieval whose key K (db_index for
+        ReadExperience, focus entity for QueryGraph) was passed in step i:
+            within the next `util_window_steps` steps, K appears as a substring
+            in either (a) a NON-memory tool call's arguments, or (b) the model's
+            generated response text.
+
+        Why this is hack-resistant:
+        - Mentioning K only in another retrieval call does NOT count (memory
+          tools are excluded), so the policy can't loop QueryGraph -> QueryGraph
+          to farm bonus.
+        - The downstream consumer must be a non-memory tool call (env action) or
+          the model's actual response — both are gated by the parser and by
+          task structure. The policy can't fabricate "use" without producing
+          a parseable, grounded reference.
+        - We measure ratio (used_retrievals / total_retrievals), so doing many
+          useless retrievals only dilutes the reward; it can't inflate it.
+
+        Returns:
+            Tuple of (bonus, info_dict). bonus is non-negative.
+        """
+        total_retrievals = 0
+        used_retrievals = 0
+        examples: list[dict] = []
+        n_steps = len(trajectory.steps)
+
+        for i, step in enumerate(trajectory.steps):
+            pr = step.parse_result
+            if pr is None or not pr.tool_calls:
+                continue
+            for tc in pr.tool_calls:
+                if tc.name not in RETRIEVAL_TOOLS:
+                    continue
+                args = tc.arguments if isinstance(tc.arguments, dict) else {}
+                if tc.name == 'ReadExperience':
+                    key = args.get('db_index')
+                else:  # QueryGraph
+                    key = args.get('focus')
+                if not (isinstance(key, str) and key.strip()):
+                    continue
+                key = key.strip()
+                total_retrievals += 1
+
+                window_end = min(i + 1 + self.util_window_steps, n_steps)
+                used_at = -1
+                for j in range(i + 1, window_end):
+                    step_j = trajectory.steps[j]
+                    # (a) check non-memory tool call args
+                    pr_j = step_j.parse_result
+                    found = False
+                    if pr_j is not None and pr_j.tool_calls:
+                        for tc_j in pr_j.tool_calls:
+                            if tc_j.name in MEMORY_TOOLS:
+                                continue
+                            try:
+                                args_str = json.dumps(tc_j.arguments, sort_keys=True)
+                            except (TypeError, ValueError):
+                                args_str = str(tc_j.arguments)
+                            if key in args_str:
+                                found = True
+                                break
+                    # (b) check model response text
+                    if not found:
+                        resp = getattr(step_j, 'model_response', '') or ''
+                        if isinstance(resp, str) and key in resp:
+                            found = True
+                    if found:
+                        used_at = j
+                        break
+
+                if used_at >= 0:
+                    used_retrievals += 1
+                    if len(examples) < 5:
+                        examples.append({
+                            'retrieval_step': i,
+                            'tool': tc.name,
+                            'key': key,
+                            'used_at_step': used_at,
+                        })
+
+        ratio = used_retrievals / total_retrievals if total_retrievals > 0 else 0.0
+        bonus = self.lambda_util * ratio
+
+        return bonus, {
+            'retrieval_utility_bonus': bonus,
+            'total_retrievals': total_retrievals,
+            'used_retrievals': used_retrievals,
+            'utility_ratio': ratio,
+            'examples': examples,
         }

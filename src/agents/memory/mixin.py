@@ -58,12 +58,16 @@ class MemoryAgentMixin:
         auto_compress_prompt: bool = True,
         disable_retrieve: bool = False,
         max_summary_tokens: int = 0,
+        edge_schema: Any = None,
     ) -> None:
         """Initialize memory capabilities.
 
         Args:
             max_summary_tokens: If > 0, truncate summary to this many tokens (approx).
                 Forces model to store details in db_blocks and use ReadExperience.
+            edge_schema: graph_db only. Optional iterable of allowed edge type
+                names (case-insensitive). Edges with types outside this set are
+                soft-dropped at index time. Pass None to keep open vocabulary.
         """
         self.compression_mode = compression_mode
         self.context_length_threshold = context_length_threshold
@@ -103,11 +107,15 @@ class MemoryAgentMixin:
                 from src.database.context_database import create_context_database
                 self.context_db = create_context_database(backend="memory")
         elif compression_mode == "graph_db":
+            self.edge_schema: Any = edge_schema
             if context_db is not None:
                 self.context_db = context_db
             else:
                 from src.database.context_database import create_context_database
-                self.context_db = create_context_database(backend="graph")
+                self.context_db = create_context_database(
+                    backend="graph",
+                    edge_schema=edge_schema,
+                )
         else:
             self.context_db = None
 

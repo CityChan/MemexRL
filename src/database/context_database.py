@@ -258,7 +258,7 @@ def create_context_database(backend: str = "memory", **kwargs) -> ContextDatabas
         )
     elif backend == "graph":
         from .graph_context_database import GraphContextDatabase
-        return GraphContextDatabase()
+        return GraphContextDatabase(edge_schema=kwargs.get("edge_schema"))
     else:
         raise ValueError(f"Unknown backend: {backend}. Choose from: memory, sqlite, redis, graph")
 

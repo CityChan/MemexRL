@@ -293,6 +293,7 @@ class ToolAgentWithMemory(MemoryAgentMixin, ToolAgent):
         auto_compress_prompt: bool = True,
         disable_retrieve: bool = False,
         max_summary_tokens: int = 0,
+        edge_schema: Any = None,
         # Tool format suffix (appended after memory tools)
         tool_format_suffix: Optional[str] = None,
     ):
@@ -330,6 +331,7 @@ class ToolAgentWithMemory(MemoryAgentMixin, ToolAgent):
             auto_compress_prompt=auto_compress_prompt,
             disable_retrieve=disable_retrieve,
             max_summary_tokens=max_summary_tokens,
+            edge_schema=edge_schema,
         )
 
         # Build system prompt: base + memory_tools + tool_format_suffix
@@ -340,7 +342,11 @@ class ToolAgentWithMemory(MemoryAgentMixin, ToolAgent):
                 # Graph mode bundles compress + ReadExperience + QueryGraph in
                 # one prompt. init_memory() forces disable_retrieve=False in
                 # this mode (with a warning), so prompt and runtime agree.
-                memory_prompt = get_memory_tools_prompt_graph(tool_call_format)
+                # When edge_schema is set, the prompt advertises the closed
+                # vocabulary so the policy doesn't invent edge labels.
+                memory_prompt = get_memory_tools_prompt_graph(
+                    tool_call_format, edge_schema=edge_schema
+                )
             elif disable_retrieve:
                 memory_prompt = get_memory_tools_prompt_compress_only(tool_call_format)
             else:
