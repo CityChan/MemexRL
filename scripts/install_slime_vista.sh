@@ -64,6 +64,20 @@ LOG_DIR="$PROJ/install_logs"
 
 mkdir -p "$PROJ" "$STAMP_DIR" "$LOG_DIR"
 
+# Ensure freshly-installed micromamba is on PATH even when this script is run
+# in a non-interactive bash (which does NOT source ~/.bashrc). Without this,
+# the curl-installed micromamba at ~/.local/bin/micromamba is invisible to
+# the script and `eval "$(micromamba shell hook ...)"` exits silently under
+# `set -e`.
+export PATH="$HOME/.local/bin:$PATH"
+
+# Default MAMBA_ROOT_PREFIX to a /work-friendly location so envs don't blow
+# up the tiny /home1 quota on TACC (23 GB; a slime env is 30-50 GB). Override
+# by exporting MAMBA_ROOT_PREFIX before running.
+: "${MAMBA_ROOT_PREFIX:=$PROJ/.micromamba}"
+export MAMBA_ROOT_PREFIX
+mkdir -p "$MAMBA_ROOT_PREFIX"
+
 # CLI flags ------------------------------------------------------------------
 FORCE=0
 FROM_STEP=0
@@ -138,7 +152,33 @@ if step 1 "install micromamba (if missing) and create $ENV_NAME env"; then
         log "installing micromamba via curl ..."
         yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
     fi
-    # ensure shell hook is loaded for non-interactive shell
+    # The curl installer may not have made micromamba visible to this shell yet
+    # (it touches ~/.bashrc, but non-interactive bash doesn't source that).
+    # Force-add the canonical install location to PATH.
+    if ! command -v micromamba >/dev/null 2>&1; then
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+    if ! command -v micromamba >/dev/null 2>&1; then
+        err "micromamba install completed but binary not found on PATH"
+        err "  expected at: $HOME/.local/bin/micromamba"
+        err "  ls $HOME/.local/bin/ to verify"
+        exit 1
+    fi
+    log "micromamba: $(command -v micromamba)"
+    log "MAMBA_ROOT_PREFIX: $MAMBA_ROOT_PREFIX"
+
+    # If user's ~/.bashrc was previously initialized to point at /home1, warn
+    # them (their next login shell would see envs in /home1, not where we
+    # actually create them). One-shot fix is offered.
+    if [[ -f ~/.bashrc ]] \
+        && grep -q "MAMBA_ROOT_PREFIX='/home1" ~/.bashrc \
+        && [[ "$MAMBA_ROOT_PREFIX" != /home1* ]]; then
+        log "WARNING: ~/.bashrc has MAMBA_ROOT_PREFIX=/home1/... but we use $MAMBA_ROOT_PREFIX"
+        log "  Future login shells will look at /home1 and miss the slime env."
+        log "  To fix one-time:"
+        log "    sed -i \"s|MAMBA_ROOT_PREFIX='/home1[^']*'|MAMBA_ROOT_PREFIX='$MAMBA_ROOT_PREFIX'|\" ~/.bashrc"
+    fi
+
     eval "$(micromamba shell hook -s bash)"
     if ! micromamba env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
         micromamba create -n "$ENV_NAME" python=3.12 pip -c conda-forge -y
