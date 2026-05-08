@@ -43,11 +43,21 @@
 # Total wall-time on a single GH200 idev (cold cache): ~3–5 hours.
 # =============================================================================
 
-set -euo pipefail
+# Drop `-u` (no unbound vars): conda/mamba activate scripts (e.g.
+# ~cuda-nvcc_activate.sh) reference NVCC_PREPEND_FLAGS without first defining
+# it, which trips `set -u` and crashes the install mid-step.
+set -eo pipefail
 
 # --------------------------- configuration -----------------------------------
 
-: "${PROJ:=${WORK:-/work}/vista/MemexRL}"
+# If PROJ wasn't explicitly set, derive it from this script's own location.
+# The script lives at $PROJ/scripts/install_slime_vista.sh, so the parent of
+# its directory is the project root. This avoids surprises from $WORK already
+# ending in /vista/ on TACC (which would double-up to .../vista/vista/).
+if [[ -z "${PROJ:-}" ]]; then
+    _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    PROJ=$(dirname "$_script_dir")
+fi
 : "${ENV_NAME:=slime}"
 : "${PYTORCH_CHANNEL:=cu128}"   # cu129 has no aarch64 wheel; cu128 does
 
@@ -71,10 +81,14 @@ mkdir -p "$PROJ" "$STAMP_DIR" "$LOG_DIR"
 # `set -e`.
 export PATH="$HOME/.local/bin:$PATH"
 
-# Default MAMBA_ROOT_PREFIX to a /work-friendly location so envs don't blow
-# up the tiny /home1 quota on TACC (23 GB; a slime env is 30-50 GB). Override
-# by exporting MAMBA_ROOT_PREFIX before running.
-: "${MAMBA_ROOT_PREFIX:=$PROJ/.micromamba}"
+# Force MAMBA_ROOT_PREFIX to a /work-friendly location.
+# We deliberately OVERRIDE any inherited value here (e.g. /home1/... from
+# ~/.bashrc) because the slime env will grow to 30-50 GB and /home1 quota
+# on TACC is only ~23 GB. Set FORCE_MAMBA_ROOT=0 if you really want to keep
+# a pre-existing prefix.
+if [[ "${FORCE_MAMBA_ROOT:-1}" == "1" ]]; then
+    MAMBA_ROOT_PREFIX="$PROJ/.micromamba"
+fi
 export MAMBA_ROOT_PREFIX
 mkdir -p "$MAMBA_ROOT_PREFIX"
 
