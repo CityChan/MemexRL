@@ -192,9 +192,29 @@ def stage_make_env_agent(game_file: str, mode: str, model_name: str):
 # Stage 5: run episode
 # ---------------------------------------------------------------------------
 
-def _generate(model, tok, messages: list[dict], max_new: int = 256) -> str:
+def _generate(
+    model,
+    tok,
+    messages: list[dict],
+    max_new: int = 2048,
+    enable_thinking: bool = True,
+) -> str:
     import torch
-    text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # Qwen3-Thinking models default to producing a long <think>...</think>
+    # block before any actual tool call. With small max_new this gets cut
+    # off mid-thinking and we never see a tool call. Two knobs here:
+    #   - max_new: large enough (>=2048) for thinking + answer
+    #   - enable_thinking=False: skip the <think> block entirely (Qwen3
+    #     chat templates support this via the `enable_thinking` kwarg)
+    template_kwargs = dict(
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    try:
+        text = tok.apply_chat_template(messages, **template_kwargs, enable_thinking=enable_thinking)
+    except TypeError:
+        # Older / non-Qwen3 templates ignore the kwarg
+        text = tok.apply_chat_template(messages, **template_kwargs)
     inputs = tok(text, return_tensors="pt").to("cuda")
     with torch.no_grad():
         out = model.generate(
@@ -217,8 +237,19 @@ def _wrap_env_action(tool_call) -> dict:
     }
 
 
-def stage_run_episode(model, tok, env, agent, max_steps: int) -> bool:
-    _stage(f"Stage 5: run episode (max_steps={max_steps})")
+def stage_run_episode(
+    model,
+    tok,
+    env,
+    agent,
+    max_steps: int,
+    max_new_tokens: int,
+    enable_thinking: bool,
+) -> bool:
+    _stage(
+        f"Stage 5: run episode (max_steps={max_steps}, "
+        f"max_new_tokens={max_new_tokens}, enable_thinking={enable_thinking})"
+    )
     try:
         # Reset env, prime agent with first observation
         obs, info = env.reset()
@@ -228,7 +259,11 @@ def stage_run_episode(model, tok, env, agent, max_steps: int) -> bool:
         for step in range(max_steps):
             print(f"\n  --- step {step+1} ---")
             t0 = time.time()
-            response = _generate(model, tok, agent.messages, max_new=256)
+            response = _generate(
+                model, tok, agent.messages,
+                max_new=max_new_tokens,
+                enable_thinking=enable_thinking,
+            )
             dt = time.time() - t0
             print(f"  model ({dt:.1f}s): {response[:300]!r}{' …' if len(response) > 300 else ''}")
 
@@ -317,6 +352,22 @@ def main():
         help="Memory compression mode for the agent.",
     )
     p.add_argument("--max-steps", type=int, default=10)
+    p.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=2048,
+        help="Per-turn generation budget. Thinking models (Qwen3-*-Thinking-*) "
+             "need at least 2048 to finish thinking AND emit a tool call; "
+             "smaller values get cut off mid-thinking and the agent sees "
+             "format errors every turn.",
+    )
+    p.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="Pass enable_thinking=False to the chat template, skipping the "
+             "<think>...</think> block. Qwen3 supports this. Recommended for "
+             "smoke tests where you want to see the tool call directly.",
+    )
     args = p.parse_args()
 
     n_failed = 0
@@ -332,7 +383,12 @@ def main():
     if env is None:
         sys.exit(4)
 
-    if not stage_run_episode(model, tok, env, agent, args.max_steps):
+    if not stage_run_episode(
+        model, tok, env, agent,
+        max_steps=args.max_steps,
+        max_new_tokens=args.max_new_tokens,
+        enable_thinking=not args.no_thinking,
+    ):
         n_failed += 1
     if not stage_dump_state(agent):
         n_failed += 1
