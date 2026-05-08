@@ -153,9 +153,29 @@ fi
 
 # Isolate from Vista system CUDA / compiler paths so micromamba's CUDA is
 # the only one in scope. ContextGraph's env_common sets these; we override.
-unset CUDA_HOME CUDA_PATH || true
-export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/Linux_aarch64/' | paste -sd:)
-export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '/Linux_aarch64/' | paste -sd:)
+unset CUDA_HOME CUDA_PATH NVHPC_CUDA_HOME || true
+
+# Purge ALL TACC modules. The default nvidia/24.7 module ships an HPC SDK
+# nvcc 12.5 that landed on PATH and confused PyTorch's compile-time CUDA
+# version check during flash-attn builds. We rebuild a minimal env entirely
+# from the conda installation we control.
+if command -v module >/dev/null 2>&1; then
+    module purge 2>/dev/null || true
+fi
+
+# Filter out anything that looks like a system CUDA / NVIDIA HPC SDK path.
+# `/Linux_aarch64/` covers TACC's `/home1/apps/nvidia/Linux_aarch64/...`,
+# `/opt/apps/nvidia` covers the openmpi-bundled HPC SDK on Vista, and
+# `/cuda` catches any leftover `module load cuda/...` paths.
+_filter_path() {
+    echo "$1" | tr ':' '\n' \
+        | grep -v '/Linux_aarch64/' \
+        | grep -v '/opt/apps/nvidia' \
+        | grep -Ev '/cuda(/|[0-9])' \
+        | paste -sd:
+}
+export PATH=$(_filter_path "$PATH")
+export LD_LIBRARY_PATH=$(_filter_path "${LD_LIBRARY_PATH:-}")
 
 cd "$PROJ"
 
@@ -210,14 +230,33 @@ log "active env: $CONDA_PREFIX"
 
 # --------------------------- step 2: CUDA + cuDNN ----------------------------
 
-if step 2 "install CUDA 12.9.1 + nvtx + nccl + cuDNN via conda"; then
-    micromamba install -n "$ENV_NAME" -c nvidia/label/cuda-12.9.1 \
+if step 2 "install CUDA + nvtx + nccl + cuDNN via conda (matching PYTORCH_CHANNEL=$PYTORCH_CHANNEL)"; then
+    # Pin conda CUDA to match the PyTorch wheel's CUDA version exactly.
+    # PyTorch's _check_cuda_version requires major.minor agreement at
+    # extension build time, so installing CUDA 12.9 with a cu128 wheel will
+    # fail flash-attn with "CUDA version mismatch".
+    case "$PYTORCH_CHANNEL" in
+        cu128) CUDA_LABEL="12.8.1" ;;
+        cu129) CUDA_LABEL="12.9.1" ;;
+        src)   CUDA_LABEL="12.9.1" ;;
+        *) err "unknown PYTORCH_CHANNEL: $PYTORCH_CHANNEL"; exit 2 ;;
+    esac
+    log "installing CUDA $CUDA_LABEL via conda channel nvidia/label/cuda-$CUDA_LABEL"
+    micromamba install -n "$ENV_NAME" -c "nvidia/label/cuda-$CUDA_LABEL" \
         cuda cuda-nvtx cuda-nvtx-dev nccl -y
     micromamba install -n "$ENV_NAME" -c conda-forge cudnn -y
-    # Sanity: nvcc must be from the conda env
+    # Sanity: nvcc must be from the conda env, and report a release matching
+    # the channel we asked for.
     which nvcc | grep -q "$CONDA_PREFIX" \
         || { err "nvcc not from $CONDA_PREFIX — env path leak"; exit 1; }
     nvcc --version | tee "$LOG_DIR/nvcc_version.txt"
+    nvcc_release=$(nvcc --version | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2}')
+    cuda_label_short=${CUDA_LABEL%.*}
+    if [[ "$nvcc_release" != "$cuda_label_short" ]]; then
+        err "nvcc reports release $nvcc_release but we asked for $cuda_label_short"
+        err "  CUDA install did not pin correctly. Investigate."
+        exit 1
+    fi
     done_stamp 2
 fi
 
@@ -282,6 +321,19 @@ fi
 export TORCH_CUDA_ARCH_LIST="9.0"
 export FLASH_ATTN_CUDA_ARCHS=90
 export MAX_JOBS="${MAX_JOBS:-64}"
+
+# Re-pin CUDA env right before any CUDA-extension compile. Some pip installs
+# in earlier steps may have overwritten CUDA_HOME via package activate hooks
+# (e.g. transformer_engine, modelopt). Force the env's view back in line so
+# nvcc / cuDNN headers / libs all resolve to the conda env we set up in
+# step 2.
+export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_PATH="$CONDA_PREFIX"
+export PATH="$CONDA_PREFIX/bin:$PATH"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+log "compile env: CUDA_HOME=$CUDA_HOME"
+log "             nvcc=$(which nvcc)"
+nvcc --version | head -5 | tee -a "$LOG_DIR/compile_env.txt"
 
 if step 7 "build flash-attn 2.7.4.post1 (TORCH_CUDA_ARCH_LIST=9.0)"; then
     pip install flash-attn==2.7.4.post1 --no-build-isolation
