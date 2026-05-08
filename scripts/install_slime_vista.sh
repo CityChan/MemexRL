@@ -244,7 +244,21 @@ if step 2 "install CUDA + nvtx + nccl + cuDNN via conda (matching PYTORCH_CHANNE
     log "installing CUDA $CUDA_LABEL via conda channel nvidia/label/cuda-$CUDA_LABEL"
     micromamba install -n "$ENV_NAME" -c "nvidia/label/cuda-$CUDA_LABEL" \
         cuda cuda-nvtx cuda-nvtx-dev nccl -y
-    micromamba install -n "$ENV_NAME" -c conda-forge cudnn -y
+
+    # cuDNN: install via pip nvidia-cudnn-cu12 (CUDA 12 compatible) instead
+    # of conda-forge cudnn. Reason: on aarch64 the conda-forge cudnn package
+    # depends on conda-forge CUDA 13.2, which forces a solver-driven upgrade
+    # of every CUDA package we just pinned to 12.8 — silently breaking
+    # PyTorch+CUDA major.minor agreement. Slime's upstream build_conda.sh
+    # uses conda-forge cudnn but is unaffected on x86_64. We pip-install the
+    # same cuDNN version Slime pins later (9.16.0.29) so transformer_engine
+    # in step 9 has cuDNN headers available at compile time.
+    #
+    # We only have pip available after the env is activated (step 1 created
+    # the env, then activate happened above). Run pip install for cuDNN here
+    # so steps 7-9 have it on the wheel path.
+    log "installing nvidia-cudnn-cu12==9.16.0.29 via pip (CUDA-12-compatible)"
+    pip install --no-cache-dir nvidia-cudnn-cu12==9.16.0.29
     # Sanity: nvcc must be from the conda env, and report a release matching
     # the channel we asked for.
     which nvcc | grep -q "$CONDA_PREFIX" \
