@@ -334,7 +334,17 @@ fi
 
 export TORCH_CUDA_ARCH_LIST="9.0"
 export FLASH_ATTN_CUDA_ARCHS=90
-export MAX_JOBS="${MAX_JOBS:-64}"
+
+# Default MAX_JOBS=8 on Vista. flash-attn / Apex / TE are template-heavy CUDA
+# extensions whose nvcc passes can each consume 4-8 GB RAM; with `--threads 2`
+# per nvcc and ninja `-j N`, total parallel CUDA threads = 2*N. Slime's
+# upstream Docker uses 64 because their builder nodes have ~1TB RAM. A single
+# Vista GH200 idev allocation has ~480 GB shared (CPU+GPU) memory and OOMs
+# silently with 64 (ninja stops with no error text — characteristic of
+# kernel-killed children). 8 fits cleanly with ~16 parallel threads.
+# Override with `MAX_JOBS=N bash scripts/install_slime_vista.sh ...`.
+export MAX_JOBS="${MAX_JOBS:-8}"
+log "compile parallelism: MAX_JOBS=$MAX_JOBS (override with MAX_JOBS=N before running)"
 
 # Re-pin CUDA env right before any CUDA-extension compile. Some pip installs
 # in earlier steps may have overwritten CUDA_HOME via package activate hooks
@@ -390,10 +400,14 @@ fi
 # nvcc visibility (must be the conda one), TORCH_CUDA_ARCH_LIST=9.0, and
 # that PyTorch's CUDA matches the env's nvcc.
 
-if step 10 "build NVIDIA Apex @ $APEX_COMMIT (~30–60 min)"; then
-    NVCC_APPEND_FLAGS="--threads 4" \
+if step 10 "build NVIDIA Apex @ $APEX_COMMIT (~30–60 min, longer with low MAX_JOBS)"; then
+    # Apex on Vista needs the same memory taming as flash-attn. Use MAX_JOBS
+    # for both setup.py's --parallel and nvcc threads so we never blow past
+    # ~16 parallel CUDA compile threads.
+    apex_par="${MAX_JOBS}"
+    NVCC_APPEND_FLAGS="--threads 2" \
     pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation \
-        --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" \
+        --config-settings "--build-option=--cpp_ext --cuda_ext --parallel ${apex_par}" \
         "git+https://github.com/NVIDIA/apex.git@${APEX_COMMIT}"
     python -c 'import apex; from apex.optimizers import FusedAdam; print("apex ok")'
     done_stamp 10
