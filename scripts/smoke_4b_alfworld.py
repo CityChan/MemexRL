@@ -237,6 +237,15 @@ def _wrap_env_action(tool_call) -> dict:
     }
 
 
+_FORCE_COMPRESS_NUDGE = (
+    "[SYSTEM NUDGE — smoke test] Your working context is getting long. "
+    "Before your next env action, you MUST emit a single CompressExperience "
+    "tool call summarizing what you've learned so far. In graph_db mode, "
+    "include `entity` and `relations` fields in each db_block so the graph "
+    "can be queried later. Use the tool format from the system prompt."
+)
+
+
 def stage_run_episode(
     model,
     tok,
@@ -245,6 +254,7 @@ def stage_run_episode(
     max_steps: int,
     max_new_tokens: int,
     enable_thinking: bool,
+    force_compress_at: int = -1,
 ) -> bool:
     _stage(
         f"Stage 5: run episode (max_steps={max_steps}, "
@@ -258,6 +268,15 @@ def stage_run_episode(
 
         for step in range(max_steps):
             print(f"\n  --- step {step+1} ---")
+
+            # Inject a "compress now" nudge right before the configured step.
+            # This is the cold-start test: with the model FORCED to attempt a
+            # CompressExperience call, can it produce well-formed db_blocks
+            # (and in graph_db mode, sensible entity / relations)?
+            if force_compress_at == step + 1:
+                _info(f"FORCING compression at step {step+1} via system nudge")
+                agent.messages.append({"role": "user", "content": _FORCE_COMPRESS_NUDGE})
+
             t0 = time.time()
             response = _generate(
                 model, tok, agent.messages,
@@ -368,6 +387,15 @@ def main():
              "<think>...</think> block. Qwen3 supports this. Recommended for "
              "smoke tests where you want to see the tool call directly.",
     )
+    p.add_argument(
+        "--force-compress-at",
+        type=int,
+        default=-1,
+        help="Inject a system nudge before step N forcing the model to emit a "
+             "CompressExperience tool call. Use this to test cold-start "
+             "graph_db output quality without waiting for the auto-compress "
+             "threshold to trigger naturally. Example: --force-compress-at 5",
+    )
     args = p.parse_args()
 
     n_failed = 0
@@ -388,6 +416,7 @@ def main():
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
         enable_thinking=not args.no_thinking,
+        force_compress_at=args.force_compress_at,
     ):
         n_failed += 1
     if not stage_dump_state(agent):
