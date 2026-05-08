@@ -259,6 +259,21 @@ if step 2 "install CUDA + nvtx + nccl + cuDNN via conda (matching PYTORCH_CHANNE
     # so steps 7-9 have it on the wheel path.
     log "installing nvidia-cudnn-cu12==9.16.0.29 via pip (CUDA-12-compatible)"
     pip install --no-cache-dir nvidia-cudnn-cu12==9.16.0.29
+
+    # Pip puts cuDNN headers/libs under site-packages/nvidia/cudnn/{include,lib}.
+    # That location is invisible to C++ compilers (no default -I/-L search).
+    # Symlink the headers and libs into $CONDA_PREFIX/{include,lib} so any
+    # later CUDA-extension build (transformer_engine in step 9, etc.) finds
+    # cudnn.h via #include <cudnn.h> and libcudnn.so via -lcudnn.
+    cudnn_pip="$CONDA_PREFIX/lib/python3.12/site-packages/nvidia/cudnn"
+    if [[ -d "$cudnn_pip/include" && -d "$cudnn_pip/lib" ]]; then
+        ln -sf "$cudnn_pip"/include/*.h    "$CONDA_PREFIX/include/" 2>/dev/null || true
+        ln -sf "$cudnn_pip"/lib/*.so*      "$CONDA_PREFIX/lib/"     2>/dev/null || true
+        log "cuDNN headers/libs symlinked into env include/ and lib/"
+    else
+        err "pip cudnn install did not produce expected layout under $cudnn_pip"
+        exit 1
+    fi
     # Sanity: nvcc must be from the conda env, and report a release matching
     # the channel we asked for.
     which nvcc | grep -q "$CONDA_PREFIX" \
