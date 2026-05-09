@@ -29,6 +29,48 @@ ray stop --force 2>/dev/null; pkill -9 ray 2>/dev/null; sleep 2
 set -ex
 
 # ============================================================================
+# One-shot Slime monkey-patch:
+# MemexRL's generate_with_memex returns list[Sample] for episodes that
+# triggered auto-compression (one Sample per segment). Slime's
+# compute_metrics_from_samples and other downstream code iterate samples
+# expecting flat list[Sample] and break on AttributeError.
+#
+# Idempotent: only patches if the marker comment isn't already present.
+# Touches the vendored slime clone at $PROJ/slime, which we control.
+# ============================================================================
+SLIME_DIR_PATCH="${PROJ:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/slime"
+python <<PY
+import os
+src = os.path.join("$SLIME_DIR_PATCH", "slime", "ray", "rollout.py")
+marker = "# MEMEX_PATCH: flatten nested Sample lists"
+with open(src) as f:
+    code = f.read()
+if marker in code:
+    print(f"[memex-patch] {src}: already patched")
+else:
+    needle = "def compute_metrics_from_samples(args, samples):"
+    if needle not in code:
+        raise SystemExit(f"[memex-patch] could not find '{needle}' in {src}")
+    new = (
+        f"def _memex_flatten(samples):\n"
+        f"    {marker}\n"
+        f"    flat = []\n"
+        f"    for s in samples:\n"
+        f"        if isinstance(s, list):\n"
+        f"            flat.extend(s)\n"
+        f"        else:\n"
+        f"            flat.append(s)\n"
+        f"    return flat\n\n"
+        f"{needle}\n"
+        f"    samples = _memex_flatten(samples)\n"
+    )
+    code = code.replace(needle, new)
+    with open(src, "w") as f:
+        f.write(code)
+    print(f"[memex-patch] patched {src}")
+PY
+
+# ============================================================================
 # Paths
 # ============================================================================
 
