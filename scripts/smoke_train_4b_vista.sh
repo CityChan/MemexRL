@@ -161,9 +161,16 @@ ROLLOUT_ARGS=(
     --rollout-max-context-len "${MEMEX_MAX_CONTEXT_LEN}"
     --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
     --global-batch-size "${GLOBAL_BATCH_SIZE:-8}"
-    --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+    # Skip the upstream-Slime check_reward_nonzero_std filter for smoke.
+    # MemexRL's generate_with_memex returns list[list[Sample]] (two levels)
+    # while Slime's filter expects list[Sample]; the two were tested
+    # against different Slime tags. Set DYNAMIC_SAMPLING_FILTER=1 to
+    # restore it once the filter contract is unified.
     --balance-data
 )
+if [[ "${DYNAMIC_SAMPLING_FILTER:-0}" == "1" ]]; then
+    ROLLOUT_ARGS+=(--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std)
+fi
 
 EVAL_ARGS=()                                          # skip eval in smoke
 if [[ "${ENABLE_EVAL:-false}" == "true" ]]; then
