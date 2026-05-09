@@ -45,29 +45,60 @@ src = os.path.join("$SLIME_DIR_PATCH", "slime", "ray", "rollout.py")
 marker = "# MEMEX_PATCH: flatten nested Sample lists"
 with open(src) as f:
     code = f.read()
-if marker in code:
-    print(f"[memex-patch] {src}: already patched")
-else:
-    needle = "def compute_metrics_from_samples(args, samples):"
-    if needle not in code:
-        raise SystemExit(f"[memex-patch] could not find '{needle}' in {src}")
-    new = (
-        f"def _memex_flatten(samples):\n"
+
+# We may need to apply multiple patches. The marker is on the helper, which
+# is added once. The per-function flatten lines are also idempotent (re-running
+# just inserts the line after a def... we guard by checking if the line is
+# already present).
+
+if "def _memex_flatten(samples):" not in code:
+    helper = (
+        "def _memex_flatten(samples):\n"
         f"    {marker}\n"
-        f"    flat = []\n"
-        f"    for s in samples:\n"
-        f"        if isinstance(s, list):\n"
-        f"            flat.extend(s)\n"
-        f"        else:\n"
-        f"            flat.append(s)\n"
-        f"    return flat\n\n"
-        f"{needle}\n"
-        f"    samples = _memex_flatten(samples)\n"
+        "    flat = []\n"
+        "    for s in samples:\n"
+        "        if isinstance(s, list):\n"
+        "            flat.extend(s)\n"
+        "        else:\n"
+        "            flat.append(s)\n"
+        "    return flat\n\n\n"
     )
-    code = code.replace(needle, new)
-    with open(src, "w") as f:
-        f.write(code)
-    print(f"[memex-patch] patched {src}")
+    # Insert at top of file after imports. Find the first 'def ' or 'class '.
+    insertion_point = code.find("\ndef ")
+    if insertion_point < 0:
+        insertion_point = code.find("\nclass ")
+    if insertion_point < 0:
+        raise SystemExit(f"[memex-patch] could not find a def/class in {src}")
+    code = code[:insertion_point + 1] + helper + code[insertion_point + 1:]
+    print(f"[memex-patch] inserted _memex_flatten helper")
+
+# Functions that iterate samples and need flattening at the top.
+targets = [
+    "def compute_metrics_from_samples(args, samples):",
+    "def compute_perf_metrics_from_samples(args, samples, rollout_time):",
+    "def _log_rollout_data(rollout_id, args, data, metrics, rollout_time):",
+]
+flatten_call = "    samples = _memex_flatten(samples)\n"
+log_flatten_call = "    data = _memex_flatten(data)\n"
+
+for needle in targets:
+    if needle not in code:
+        # Some functions may not exist on all slime tags — skip silently
+        print(f"[memex-patch] skip (not found): {needle}")
+        continue
+    if needle == targets[2]:
+        # _log_rollout_data uses `data` not `samples`
+        injected = needle + "\n" + log_flatten_call
+    else:
+        injected = needle + "\n" + flatten_call
+    if injected in code:
+        print(f"[memex-patch] already inline-patched: {needle}")
+        continue
+    code = code.replace(needle, injected, 1)
+    print(f"[memex-patch] patched: {needle}")
+
+with open(src, "w") as f:
+    f.write(code)
 PY
 
 # ============================================================================
