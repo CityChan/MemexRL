@@ -161,10 +161,11 @@ export SGLANG_DISABLE_SLEEP_MODE=1
 # room. (RAY_memory_monitor_refresh_ms=0 would disable the monitor
 # entirely; we keep it on, just less aggressive.)
 export RAY_memory_usage_threshold=0.98
-# Reduce GPU memory fragmentation so the train step can find a contiguous
-# block for the entropy clone. Recommended by PyTorch when allocations
-# fail despite "reserved but unallocated" memory being available.
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# NB: tried PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here to
+# defragment for the entropy clone, but it broke SGLang's CUDA graphs
+# ("Server process terminated unexpectedly"). expandable_segments
+# allocator is incompatible with CUDA-graph-replay-style workloads.
+# Smaller batch + max_context_len handle the entropy OOM without it.
 
 # ============================================================================
 # Memex agent config (smoke-friendly)
