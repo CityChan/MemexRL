@@ -165,7 +165,12 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict):
             sample.rollout_log_probs = result.rollout_log_probs if result.rollout_log_probs else None
             sample.status = status_map.get(result.status, Sample.Status.FAILED)
             sample.metadata = result.metadata
-            return sample
+            # Always return list[Sample] to match Slime's contract:
+            # _get_rollout_data does itertools.chain.from_iterable(data)
+            # over rollout outputs, which requires every element to be
+            # iterable. The segmented branch above already returns list;
+            # this single-Sample branch must wrap to be consistent.
+            return [sample]
 
     except Exception as e:
         logger.error(f"generate() failed: {e}", exc_info=True)
@@ -180,7 +185,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict):
             sample.loss_mask = []
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = []
-        return sample
+        return [sample]   # list-wrap to match Slime chain.from_iterable contract
 
     finally:
         # Always clean up the environment to prevent Docker container leaks
