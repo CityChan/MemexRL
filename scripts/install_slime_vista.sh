@@ -492,9 +492,16 @@ fi
 
 # --------------------------- step 15: post-pin overrides ---------------------
 
-if step 15 "post-pin overrides (cudnn, numpy<2)"; then
+if step 15 "post-pin overrides (cudnn, numpy<2, fastapi/starlette)"; then
     pip install nvidia-cudnn-cu12==9.16.0.29
     pip install "numpy<2"
+    # Slime's router uses FastAPI's deprecated `add_event_handler`, which
+    # starlette 1.0 removed. Slime requirements.txt doesn't pin fastapi /
+    # starlette; the upstream Docker image was built when these were both
+    # in the 0.x line. Pin them explicitly so a fresh bare-metal install
+    # gets the right combination (slime/router/router.py would otherwise
+    # AttributeError at first rollout).
+    pip install "fastapi<0.116" "starlette<1.0"
     done_stamp 15
 fi
 
