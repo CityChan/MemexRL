@@ -154,6 +154,13 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # vLLM sleep mode + free_cache_engine break on Vista's CUDA driver. Disable
 # both so the rollout engine doesn't crash on idle.
 export SGLANG_DISABLE_SLEEP_MODE=1
+# Vista idev compute nodes have ~212 GB CPU memory; with SGLang scheduler
+# (~2 GB) + rollout manager + Megatron actor we can brush 95% Ray's
+# default OOM-kill threshold during the rollout->train transition before
+# SGLang finishes releasing memory. Bump to 0.98 to give some breathing
+# room. (RAY_memory_monitor_refresh_ms=0 would disable the monitor
+# entirely; we keep it on, just less aggressive.)
+export RAY_memory_usage_threshold=0.98
 
 # ============================================================================
 # Memex agent config (smoke-friendly)
@@ -279,10 +286,18 @@ OPTIMIZER_ARGS=(
     --weight-decay 0.1
     --adam-beta1 0.9
     --adam-beta2 0.98
-    --optimizer-cpu-offload
-    --overlap-cpu-optimizer-d2h-h2d
     --use-precision-aware-optimizer
 )
+# Optimizer CPU offload: enabled by default in production (30B-A3B + 8 GPUs
+# is too big to keep optimizer state on each GPU). Disabled by default for
+# this single-GPU smoke because it eats ~118 GB CPU memory for the Adam
+# state and Vista idev nodes only allocate ~212 GB CPU memory; SGLang +
+# rollout manager + Ray overhead push us past Ray's 0.95 OOM-kill threshold.
+# 4B model's optimizer state fits comfortably on a 96 GB GH200, so keeping
+# it on GPU is fine. Set USE_CPU_OFFLOAD=1 to re-enable.
+if [[ "${USE_CPU_OFFLOAD:-0}" == "1" ]]; then
+    OPTIMIZER_ARGS+=(--optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d)
+fi
 
 # Single-GPU dense model: TP=1, EP=1, no MoE expert parallel.
 NUM_GPUS="${NUM_GPUS:-1}"
