@@ -24,9 +24,19 @@ set -eo pipefail
 
 PROJ="${PROJ:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 SLIME_ROOT="${SLIME_ROOT:-$PROJ/slime}"
+MEGATRON_ROOT="${MEGATRON_ROOT:-$PROJ/Megatron-LM}"
 MODEL_HF="${MODEL_HF:-$PROJ/models/Qwen3-4B-Instruct-2507}"
 MODEL_INT4="${MODEL_INT4:-${MODEL_HF}-int4}"
 MODEL_TD="${MODEL_TD:-${MODEL_INT4}_torch_dist}"
+
+# Megatron-LM's `pip install -e .` only exposes megatron.core. The
+# convert_hf_to_torch_dist.py script we're about to call imports
+# megatron.training.arguments, which lives in the repo source but is NOT
+# packaged. Need to put the repo on PYTHONPATH explicitly. Slime's own
+# training scripts do this via Ray runtime_env; for our standalone prep
+# we set it directly.
+[[ -d "$MEGATRON_ROOT" ]] || { echo "[ERROR] Megatron-LM repo missing at $MEGATRON_ROOT" >&2; exit 1; }
+export PYTHONPATH="$MEGATRON_ROOT:$SLIME_ROOT:${PYTHONPATH:-}"
 
 log()  { printf '\033[1;36m[%s]\033[0m %s\n' "$(date '+%H:%M:%S')" "$*"; }
 err()  { printf '\033[1;31m[%s ERROR]\033[0m %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
