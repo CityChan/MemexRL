@@ -111,9 +111,20 @@ MEMEX_LAMBDA_FORMAT="${LAMBDA_FORMAT:-1}"
 # Slime model config
 # ============================================================================
 
-# Qwen3-4B-Instruct-2507 — verify the rotary base in its config.json. The
-# Thinking variant uses 1e7; Instruct may use the same or default 1e6.
-MODEL_ARGS_ROTARY_BASE="${MODEL_ARGS_ROTARY_BASE:-10000000}"
+# Read rope_theta from the actual HF config.json instead of hard-coding it.
+# The Thinking variant uses 1e7, Instruct-2507 uses 5e6, base Qwen3 uses 1e6,
+# and Slime's hf_validate_args strictly checks they match. Reading from the
+# model's own config makes the script work for any Qwen3 variant.
+if [[ -z "${MODEL_ARGS_ROTARY_BASE:-}" ]]; then
+    MODEL_ARGS_ROTARY_BASE=$(python - <<PY
+import json, sys
+cfg = json.load(open("$MODEL_HF/config.json"))
+print(int(cfg.get("rope_theta", 1000000)))
+PY
+)
+    echo "[smoke] auto-detected rope_theta = $MODEL_ARGS_ROTARY_BASE from $MODEL_HF/config.json"
+fi
+export MODEL_ARGS_ROTARY_BASE
 
 MODEL_ARG_FILE="$SLIME_ROOT/scripts/models/qwen3-4B.sh"
 if [[ ! -f "$MODEL_ARG_FILE" ]]; then

@@ -88,10 +88,17 @@ else
     log "==== Step 2: BF16 -> torch_dist (Megatron) ===="
     log "    expected ~5-10 minutes for 4B"
 
-    # Thinking-2507 uses rotary_base=1e7 — Instruct may differ; the model's
-    # config.json is authoritative. We pass MODEL_ARGS from Slime's arch script,
-    # which sets ROPE base and other knobs.
-    MODEL_ARGS_ROTARY_BASE=10000000
+    # Read rope_theta from the actual HF config.json. Qwen3 variants disagree:
+    #   Thinking-2507 -> 1e7, Instruct-2507 -> 5e6, base Qwen3 -> 1e6.
+    # Slime's hf_validate_args is strict. Read it instead of guessing.
+    MODEL_ARGS_ROTARY_BASE=$(python - <<PY
+import json
+cfg = json.load(open("$MODEL_HF/config.json"))
+print(int(cfg.get("rope_theta", 1000000)))
+PY
+)
+    log "auto-detected rope_theta = $MODEL_ARGS_ROTARY_BASE from $MODEL_HF/config.json"
+    export MODEL_ARGS_ROTARY_BASE
     # shellcheck source=/dev/null
     source "$MODEL_ARG_FILE"
 
