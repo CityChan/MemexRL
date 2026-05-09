@@ -161,6 +161,10 @@ export SGLANG_DISABLE_SLEEP_MODE=1
 # room. (RAY_memory_monitor_refresh_ms=0 would disable the monitor
 # entirely; we keep it on, just less aggressive.)
 export RAY_memory_usage_threshold=0.98
+# Reduce GPU memory fragmentation so the train step can find a contiguous
+# block for the entropy clone. Recommended by PyTorch when allocations
+# fail despite "reserved but unallocated" memory being available.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ============================================================================
 # Memex agent config (smoke-friendly)
@@ -179,7 +183,7 @@ ALFWORLD_HIDE_INITIAL_OBS="${HIDE_INITIAL_OBS:-true}"
 ALFWORLD_LIMIT_LOOK="${LIMIT_LOOK:-true}"
 MEMEX_MAX_SUMMARY_TOKENS="${MAX_SUMMARY_TOKENS:-300}"
 
-MEMEX_MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-16000}"           # smaller than 32K
+MEMEX_MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-8000}"            # smaller than 32K (was 16000; entropy clone OOM at higher)
 MEMEX_PARALLEL_ENV="${PARALLEL_ENV:-false}"                 # 1 GPU, no need for parallel envs
 
 MEMEX_REWARD_SHAPER_ENABLE="${REWARD_SHAPER_ENABLE:-true}"
@@ -235,12 +239,12 @@ ROLLOUT_ARGS=(
     --input-key prompt
     --rollout-shuffle
     --num-rollout "${NUM_ROLLOUT:-3}"               # 3 rollouts for smoke
-    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-4}"
-    --n-samples-per-prompt "${N_SAMPLES:-2}"
+    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-2}" # smaller (was 4) to fit train step on 1x GH200
+    --n-samples-per-prompt "${N_SAMPLES:-1}"        # smaller (was 2) — total = batch*samples training tokens
     --rollout-max-response-len "${MEMEX_MAX_CONTEXT_LEN}"
     --rollout-max-context-len "${MEMEX_MAX_CONTEXT_LEN}"
     --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-8}"
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-2}"
     # Skip the upstream-Slime check_reward_nonzero_std filter for smoke.
     # MemexRL's generate_with_memex returns list[list[Sample]] (two levels)
     # while Slime's filter expects list[Sample]; the two were tested
@@ -317,7 +321,7 @@ PERF_ARGS=(
     --recompute-method uniform
     --recompute-num-layers 1
     --use-dynamic-batch-size
-    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-8192}"
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-4096}"
 )
 
 SGLANG_ARGS=(
