@@ -241,11 +241,17 @@ ROLLOUT_ARGS=(
     --rollout-shuffle
     --num-rollout "${NUM_ROLLOUT:-3}"               # 3 rollouts for smoke
     --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-2}" # smaller (was 4) to fit train step on 1x GH200
-    --n-samples-per-prompt "${N_SAMPLES:-1}"        # smaller (was 2) — total = batch*samples training tokens
+    # GRPO advantage = (reward - group_mean) / group_std. With n_samples=1
+    # the group has size 1, both stats are degenerate, advantage = 0,
+    # pg_loss = 0, policy never updates. ≥2 is non-negotiable for GRPO.
+    # train_smoke_v9 confirmed this empirically: succeeded but pg_loss=0.
+    --n-samples-per-prompt "${N_SAMPLES:-2}"
     --rollout-max-response-len "${MEMEX_MAX_CONTEXT_LEN}"
     --rollout-max-context-len "${MEMEX_MAX_CONTEXT_LEN}"
     --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
-    --global-batch-size "${GLOBAL_BATCH_SIZE:-2}"
+    # rollout_batch=2 × n_samples=2 = 4 episodes per rollout. global_batch=4
+    # consumes them in one train step (cleaner per-rollout step accounting).
+    --global-batch-size "${GLOBAL_BATCH_SIZE:-4}"
     # Skip the upstream-Slime check_reward_nonzero_std filter for smoke.
     # MemexRL's generate_with_memex returns list[list[Sample]] (two levels)
     # while Slime's filter expects list[Sample]; the two were tested
@@ -365,7 +371,7 @@ echo "Data          : $DATA_DIR"
 echo "ALFWorld data : $ALFWORLD_DATA"
 echo "Compression   : $MEMEX_COMPRESSION_MODE"
 echo "Rollouts      : ${NUM_ROLLOUT:-3}"
-echo "Batch         : rollout=${ROLLOUT_BATCH_SIZE:-4}  global=${GLOBAL_BATCH_SIZE:-8}  samples/prompt=${N_SAMPLES:-2}"
+echo "Batch         : rollout=${ROLLOUT_BATCH_SIZE:-2}  global=${GLOBAL_BATCH_SIZE:-2}  samples/prompt=${N_SAMPLES:-2}"
 echo "Parallelism   : NUM_GPUS=$NUM_GPUS  TP=${TP_SIZE:-1}  EP=${EP_SIZE:-1}"
 echo "WandB         : $([[ -n "${WANDB_KEY:-}" ]] && echo enabled || echo disabled)"
 echo "=========================================="

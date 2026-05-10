@@ -52,7 +52,12 @@ MEMEX_SLIME_ROOT="${MEMEX_SLIME_ROOT:-$PROJ/training}"
 MODEL_HF="${MODEL_HF:-$PROJ/models/Qwen3-30B-A3B-Thinking-2507}"
 MODEL_PATH="${MODEL_PATH:-${MODEL_HF}-int4}"
 MODEL_TD="${MODEL_TD:-${MODEL_PATH}_torch_dist}"
-MODEL_SLIME_CKPT="${MODEL_SLIME_CKPT:-${MODEL_PATH}_slime_memex}"
+# Per-mode ckpt path so lossless_db and graph_db runs don't clobber each
+# other. Two parallel/sequential runs with the same mode WILL share state
+# (resume from each other) — that's intentional, just give them a unique
+# MODEL_SLIME_CKPT or EXPERIMENT_NAME suffix if you want isolation.
+_COMPRESSION_MODE_SUFFIX="${COMPRESSION_MODE:-lossless_db}"
+MODEL_SLIME_CKPT="${MODEL_SLIME_CKPT:-${MODEL_PATH}_slime_memex_${_COMPRESSION_MODE_SUFFIX}}"
 
 DATA_DIR="${DATA_DIR:-$PROJ/data/alfworld}"
 ALFWORLD_DATA="${ALFWORLD_DATA:-$HOME/.alfworld}"
@@ -84,6 +89,17 @@ for d in "$MODEL_PATH" "$MODEL_TD" "$DATA_DIR" "$ALFWORLD_DATA"; do
 done
 [[ -f "$DATA_DIR/alfworld_train.jsonl" ]] || { echo "[ERROR] missing alfworld_train.jsonl" >&2; exit 1; }
 [[ -n "${WANDB_KEY:-}" ]] || echo "[WARN] WANDB_KEY not set — wandb logging disabled"
+
+# GRPO non-negotiable: group size ≥ 2 or advantages collapse to zero and
+# pg_loss never updates. train_smoke_v9 with N_SAMPLES=1 succeeded but
+# learned nothing (pg_loss=0 for all steps). Catch this at the door.
+N_SAMPLES_CHECK="${N_SAMPLES:-8}"
+if (( N_SAMPLES_CHECK < 2 )); then
+    echo "[ERROR] N_SAMPLES=$N_SAMPLES_CHECK < 2 — GRPO requires group size ≥ 2." >&2
+    echo "        With group size 1 the per-prompt advantage is identically zero," >&2
+    echo "        so policy gradients are zero and the actor never updates." >&2
+    exit 2
+fi
 
 # ============================================================================
 # Apply Slime monkey-patch for MemexRL list[Sample] contract.
@@ -264,13 +280,17 @@ ROLLOUT_ARGS=(
 [[ "${DYNAMIC_SAMPLING_FILTER:-0}" == "1" ]] && \
     ROLLOUT_ARGS+=(--dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std)
 
-EVAL_ARGS=(
-    --eval-interval "${EVAL_INTERVAL:-5}"
-    --eval-prompt-data alfworld-test "${DATA_DIR}/alfworld_test.jsonl"
-    --n-samples-per-eval-prompt 1
-    --eval-max-response-len "${MEMEX_MAX_CONTEXT_LEN}"
-    --eval-top-k 1
-)
+EVAL_ARGS=()
+# ENABLE_EVAL=false skips the eval loop entirely (smoke runs don't need it).
+if [[ "${ENABLE_EVAL:-true}" == "true" ]]; then
+    EVAL_ARGS=(
+        --eval-interval "${EVAL_INTERVAL:-5}"
+        --eval-prompt-data alfworld-test "${DATA_DIR}/alfworld_test.jsonl"
+        --n-samples-per-eval-prompt 1
+        --eval-max-response-len "${MEMEX_MAX_CONTEXT_LEN}"
+        --eval-top-k 1
+    )
+fi
 
 GRPO_ARGS=(
     --advantage-estimator grpo
