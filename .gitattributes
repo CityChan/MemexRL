@@ -1,0 +1,24 @@
+# Enforce LF line endings repo-wide. Project runs on Linux (Vista / Slime
+# / Slurm); Windows clones should NOT auto-convert to CRLF or `git status`
+# will perpetually show ghost-modified files.
+* text=auto eol=lf
+
+# Shell scripts must stay LF — bash on Linux trips on CRLF (`\r' command not found`).
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Python is LF too.
+*.py    text eol=lf
+
+# Binary files should never be touched.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary
+*.gz    binary
+*.tar   binary
+*.zip   binary
+*.bin   binary
+*.pt    binary
+*.safetensors binary
