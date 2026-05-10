@@ -11,3 +11,25 @@ build/
 *.log
 .DS_Store
 wandb/
+
+# ── Vendored/cloned dependencies (built or installed in-place by
+# scripts/install_slime_vista.sh; never commit these — too large and
+# every contributor builds their own).
+/Megatron-LM/
+/slime/
+/sglang/
+/flash-attention/
+/tw_src/
+
+# ── Per-machine environment state (micromamba envs, install stamps).
+/.micromamba/
+/.slime_install_state/
+
+# ── Build/run artefacts (model weights, slurm logs, install logs).
+/models/
+/logs/
+/install_logs/
+/smoke_logs/
+slurm-*.out
+slurm-*.err
+core.*
