@@ -73,11 +73,21 @@ if command -v module >/dev/null; then
     module purge 2>/dev/null || true
 fi
 
+# PATH must include $HOME/.local/bin BEFORE invoking micromamba, since
+# sbatch compute nodes start a non-interactive shell that does not source
+# ~/.bashrc and so doesn't inherit the login PATH. Without this prefix
+# the job dies on line "micromamba: command not found".
+export PATH="$HOME/.local/bin:$PATH"
+
 export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$PROJ/.micromamba}"
+if ! command -v micromamba >/dev/null 2>&1; then
+    echo "[ERROR] micromamba not on PATH. Looked in: $HOME/.local/bin." >&2
+    echo "        Override with: export MICROMAMBA_BIN=/path/to/micromamba" >&2
+    exit 1
+fi
 eval "$(micromamba shell hook -s bash)"
 micromamba activate slime
 
-export PATH="$HOME/.local/bin:$PATH"
 export ALFWORLD_DATA
 
 # ============================================================================
