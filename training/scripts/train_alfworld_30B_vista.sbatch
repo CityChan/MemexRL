@@ -73,20 +73,42 @@ if command -v module >/dev/null; then
     module purge 2>/dev/null || true
 fi
 
-# PATH must include $HOME/.local/bin BEFORE invoking micromamba, since
-# sbatch compute nodes start a non-interactive shell that does not source
-# ~/.bashrc and so doesn't inherit the login PATH. Without this prefix
-# the job dies on line "micromamba: command not found".
-export PATH="$HOME/.local/bin:$PATH"
-
-export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$PROJ/.micromamba}"
-if ! command -v micromamba >/dev/null 2>&1; then
-    echo "[ERROR] micromamba not on PATH. Looked in: $HOME/.local/bin." >&2
-    echo "        Override with: export MICROMAMBA_BIN=/path/to/micromamba" >&2
+# sbatch compute nodes start a non-interactive shell that does NOT source
+# ~/.bashrc, so the login-shell PATH (with ~/.local/bin, ~/bin, etc.) is
+# missing. Resolve the micromamba binary explicitly instead of relying
+# on PATH inheritance — search common install locations or honour an
+# MICROMAMBA_BIN override.
+if [[ -z "${MICROMAMBA_BIN:-}" ]]; then
+    for cand in \
+        "$HOME/.local/bin/micromamba" \
+        "$HOME/bin/micromamba" \
+        "$HOME/micromamba" \
+        "/usr/local/bin/micromamba" \
+        "$(command -v micromamba 2>/dev/null)"
+    do
+        if [[ -n "$cand" && -x "$cand" ]]; then
+            MICROMAMBA_BIN="$cand"
+            break
+        fi
+    done
+fi
+if [[ -z "${MICROMAMBA_BIN:-}" || ! -x "$MICROMAMBA_BIN" ]]; then
+    echo "[ERROR] micromamba binary not found." >&2
+    echo "        Searched: \$HOME/.local/bin, \$HOME/bin, \$HOME, /usr/local/bin, \$PATH" >&2
+    echo "        Set explicit path: export MICROMAMBA_BIN=/full/path/to/micromamba" >&2
     exit 1
 fi
-eval "$(micromamba shell hook -s bash)"
-micromamba activate slime
+echo "[sbatch] using micromamba at: $MICROMAMBA_BIN"
+export PATH="$(dirname "$MICROMAMBA_BIN"):$PATH"
+
+export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$PROJ/.micromamba}"
+eval "$("$MICROMAMBA_BIN" shell hook -s bash)"
+micromamba activate slime || {
+    echo "[ERROR] failed to activate 'slime' env under $MAMBA_ROOT_PREFIX" >&2
+    echo "        Available envs:" >&2
+    "$MICROMAMBA_BIN" env list >&2 || true
+    exit 1
+}
 
 export ALFWORLD_DATA
 
