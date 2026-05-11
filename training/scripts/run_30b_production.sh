@@ -158,8 +158,14 @@ submit_run() {
     local dep_arg=()
     [[ -n "$depends_on" ]] && dep_arg=(--dependency="afterany:${depends_on}")
 
-    echo
-    echo "[Run ${run_label}] submitting ${mode_value}${depends_on:+ (depends on $depends_on)}"
+    # Diagnostics go to stderr — caller captures stdout to get just the
+    # jobid. Without this split, $(submit_run ...) swallows the [Run X]
+    # lines and the user never sees the job IDs in their terminal.
+    {
+        echo
+        echo "[Run ${run_label}] submitting ${mode_value}${depends_on:+ (depends on $depends_on)}"
+    } >&2
+
     local jobid
     jobid=$(sbatch --parsable \
         -J "memex_30b_prod_${mode_value}" \
@@ -168,23 +174,23 @@ submit_run() {
         --export="$exports" \
         "${dep_arg[@]}" \
         "$SBATCH_FILE")
-    echo "[Run ${run_label}] jobid=${jobid}  experiment=${exp_name}"
-    echo "$jobid"
+    echo "[Run ${run_label}] jobid=${jobid}  experiment=${exp_name}" >&2
+    echo "$jobid"   # ← only the jobid lands on stdout, for capture
 }
 
 case "$mode" in
     lossless)
-        jid_a=$(submit_run A lossless_db | tail -n1)
+        jid_a=$(submit_run A lossless_db)
         ;;
     graph)
-        jid_b=$(submit_run B graph_db | tail -n1)
+        jid_b=$(submit_run B graph_db)
         ;;
     both)
-        jid_a=$(submit_run A lossless_db | tail -n1)
+        jid_a=$(submit_run A lossless_db)
         if $sequential; then
-            jid_b=$(submit_run B graph_db "$jid_a" | tail -n1)
+            jid_b=$(submit_run B graph_db "$jid_a")
         else
-            jid_b=$(submit_run B graph_db | tail -n1)
+            jid_b=$(submit_run B graph_db)
         fi
         ;;
 esac
