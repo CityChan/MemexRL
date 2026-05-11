@@ -101,7 +101,14 @@ fi
 echo "[sbatch] using micromamba at: $MICROMAMBA_BIN"
 export PATH="$(dirname "$MICROMAMBA_BIN"):$PATH"
 
-export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$PROJ/.micromamba}"
+# UNCONDITIONALLY override MAMBA_ROOT_PREFIX — don't fall back to whatever
+# the login shell exported. ~/.bashrc on Vista commonly sets it to
+# $HOME/micromamba (= /home1/<user>/micromamba), which (a) has only the
+# 'base' env, not 'slime', and (b) lives on the tiny /home1 quota (~25GB)
+# that fills up during installs. We always want the in-repo /work install.
+# Set MEMEX_MAMBA_ROOT_PREFIX if you really need a custom path.
+export MAMBA_ROOT_PREFIX="${MEMEX_MAMBA_ROOT_PREFIX:-$PROJ/.micromamba}"
+echo "[sbatch] MAMBA_ROOT_PREFIX=$MAMBA_ROOT_PREFIX"
 eval "$("$MICROMAMBA_BIN" shell hook -s bash)"
 micromamba activate slime || {
     echo "[ERROR] failed to activate 'slime' env under $MAMBA_ROOT_PREFIX" >&2
