@@ -191,6 +191,44 @@ export RAY_memory_usage_threshold=0.98
 # DO NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments — breaks SGLang CUDA graphs.
 
 # ============================================================================
+# Multi-node networking on Vista
+# ----------------------------------------------------------------------------
+# Job 702445/702446 died with:
+#   torch.distributed.DistNetworkError: client socket has timed out after
+#   600000ms while trying to connect to (129.114.18.157, 15171).
+#
+# Cause: Vista compute nodes expose 129.114.x.x (public/management IPs) via
+# `hostname --ip-address`. Cross-chassis TCP rendezvous on arbitrary high
+# ports over this network is slow or blocked. Force torch.distributed and
+# NCCL onto the InfiniBand IP-over-IB interface (typically `ib0` on TACC).
+#
+# Auto-detect the IB interface so this works on any TACC system; allow
+# explicit override via DIST_IFACE.
+# ============================================================================
+
+if [[ -z "${DIST_IFACE:-}" ]]; then
+    # Take the first ib*-style interface that is UP.
+    DIST_IFACE=$(ip -o link show up 2>/dev/null \
+        | awk -F': ' '{print $2}' \
+        | grep -E '^(ib|ibp|ibs|ibo)[0-9]' \
+        | head -1 || true)
+fi
+if [[ -n "$DIST_IFACE" ]]; then
+    export NCCL_SOCKET_IFNAME="$DIST_IFACE"
+    export GLOO_SOCKET_IFNAME="$DIST_IFACE"
+    export TP_SOCKET_IFNAME="$DIST_IFACE"
+    echo "[sbatch] distributed comms forced onto interface: $DIST_IFACE"
+    ip -o -4 addr show "$DIST_IFACE" 2>/dev/null \
+        | awk '{print "[sbatch]   " $2 " IPv4: " $4}'
+else
+    echo "[sbatch] WARN: no ib* interface found via 'ip link'. NCCL/GLOO will fall back to default routing." >&2
+    echo "[sbatch]       Available interfaces:" >&2
+    ip -o link show up 2>/dev/null | awk -F': ' '{print "          " $2}' >&2
+fi
+# Print one more debug line so the network state is fully visible at job start.
+echo "[sbatch] hostname=$(hostname)  hostname -I=$(hostname -I 2>/dev/null || echo n/a)"
+
+# ============================================================================
 # Multi-node Ray cluster (Slurm-driven)
 # ============================================================================
 
@@ -201,7 +239,22 @@ NUM_GPUS=$(( NUM_NODES * NUM_GPUS_PER_NODE ))
 # Resolve nodelist
 nodes=$(scontrol show hostnames "$SLURM_NODELIST")
 head_node=$(echo "$nodes" | head -n1)
-head_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address | awk '{print $1}')
+
+# Prefer the IB interface IP for inter-node Ray + torch.distributed traffic.
+# Falls back to `hostname --ip-address` (public mgmt IP) if no IB detected.
+if [[ -n "${DIST_IFACE:-}" ]]; then
+    head_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" \
+        bash -c "ip -o -4 addr show '$DIST_IFACE' 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1" \
+        2>/dev/null)
+    if [[ -z "$head_ip" ]]; then
+        echo "[sbatch] WARN: no IPv4 on $DIST_IFACE on $head_node; falling back to hostname --ip-address" >&2
+        head_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address | awk '{print $1}')
+    else
+        echo "[sbatch] using IB IP for head_ip: $head_ip (via $DIST_IFACE on $head_node)"
+    fi
+else
+    head_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address | awk '{print $1}')
+fi
 
 echo "=========================================="
 echo "Memex+Slime production training"
