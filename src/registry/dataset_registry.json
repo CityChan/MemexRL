@@ -1,0 +1,6 @@
+{
+  "alfworld": {
+    "train": "/work/09281/chc_1996/vista/MemexRL/src/data/datasets/alfworld/train.parquet",
+    "test": "/work/09281/chc_1996/vista/MemexRL/src/data/datasets/alfworld/test.parquet"
+  }
+}
