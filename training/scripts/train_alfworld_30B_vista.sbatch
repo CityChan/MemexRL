@@ -451,7 +451,7 @@ WANDB_ARGS=()
 if [[ -n "${WANDB_KEY:-}" ]]; then
     WANDB_ARGS=(
         --use-wandb
-        --wandb-project "${PROJECT_NAME:-memex-vista-30b}"
+        --wandb-project "${PROJECT_NAME:-MemexRL}"
         --wandb-group "${EXPERIMENT_NAME:-alfworld-grpo-30b-${MEMEX_COMPRESSION_MODE}-$(date +%Y%m%d)}"
         --wandb-key "${WANDB_KEY}"
     )
