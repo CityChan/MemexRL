@@ -207,10 +207,13 @@ export RAY_memory_usage_threshold=0.98
 # ============================================================================
 
 if [[ -z "${DIST_IFACE:-}" ]]; then
-    # Take the first ib*-style interface that is UP.
+    # Take the first high-speed-fabric interface that is UP. Patterns cover
+    # IB (ib*, ibp*, ibs*, ibo*), Cray Slingshot (hsn*), Mellanox bonded
+    # (bond*, mlx*), and OPA (opa*). Whatever wins is what Ray + SGLang
+    # rendezvous over.
     DIST_IFACE=$(ip -o link show up 2>/dev/null \
         | awk -F': ' '{print $2}' \
-        | grep -E '^(ib|ibp|ibs|ibo)[0-9]' \
+        | grep -E '^(ib|ibp|ibs|ibo|hsn|opa|mlx|bond)[0-9]' \
         | head -1 || true)
 fi
 if [[ -n "$DIST_IFACE" ]]; then
@@ -240,20 +243,28 @@ NUM_GPUS=$(( NUM_NODES * NUM_GPUS_PER_NODE ))
 nodes=$(scontrol show hostnames "$SLURM_NODELIST")
 head_node=$(echo "$nodes" | head -n1)
 
-# Prefer the IB interface IP for inter-node Ray + torch.distributed traffic.
-# Falls back to `hostname --ip-address` (public mgmt IP) if no IB detected.
-if [[ -n "${DIST_IFACE:-}" ]]; then
-    head_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" \
-        bash -c "ip -o -4 addr show '$DIST_IFACE' 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1" \
-        2>/dev/null)
-    if [[ -z "$head_ip" ]]; then
-        echo "[sbatch] WARN: no IPv4 on $DIST_IFACE on $head_node; falling back to hostname --ip-address" >&2
-        head_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address | awk '{print $1}')
-    else
-        echo "[sbatch] using IB IP for head_ip: $head_ip (via $DIST_IFACE on $head_node)"
+# Resolve the IB-fabric IPv4 for a given node. Falls back to
+# `hostname --ip-address` (= public mgmt IP) if DIST_IFACE is empty or
+# has no IPv4 on that node.
+_resolve_node_fabric_ip() {
+    local node="$1"
+    local ip=""
+    if [[ -n "${DIST_IFACE:-}" ]]; then
+        ip=$(srun --nodes=1 --ntasks=1 -w "$node" \
+            bash -c "ip -o -4 addr show '$DIST_IFACE' 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1" \
+            2>/dev/null)
     fi
+    if [[ -z "$ip" ]]; then
+        ip=$(srun --nodes=1 --ntasks=1 -w "$node" hostname --ip-address | awk '{print $1}')
+    fi
+    printf '%s' "$ip"
+}
+
+head_ip=$(_resolve_node_fabric_ip "$head_node")
+if [[ -n "${DIST_IFACE:-}" ]]; then
+    echo "[sbatch] head_ip=$head_ip (via $DIST_IFACE on $head_node)"
 else
-    head_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address | awk '{print $1}')
+    echo "[sbatch] head_ip=$head_ip (no DIST_IFACE — fell back to hostname --ip-address)" >&2
 fi
 
 echo "=========================================="
@@ -287,11 +298,23 @@ srun --nodes=1 --ntasks=1 -w "$head_node" \
     &
 sleep 10
 
-# Start ray workers on the remaining nodes
+# Start ray workers on the remaining nodes.
+#
+# CRITICAL: pass --node-ip-address explicitly per worker, using the same
+# fabric interface as head_ip. Without this, ray on the worker advertises
+# whatever `hostname --ip-address` resolves to (Vista public mgmt IP). slime
+# (rollout.py:610) then calls ray._private.services.get_node_ip_address()
+# inside each SGLangEngine actor and writes that mgmt IP into the engine's
+# dist_init_addr. SGLang scheduler child processes then try TCPStore
+# rendezvous over the mgmt network → 600s timeout. Worker engines fail to
+# connect to the head engine's TCPStore even when head_ip is on the fabric.
 worker_nodes=$(echo "$nodes" | tail -n +2)
 for node in $worker_nodes; do
+    worker_ip=$(_resolve_node_fabric_ip "$node")
+    echo "[sbatch] worker $node node-ip=$worker_ip"
     srun --nodes=1 --ntasks=1 -w "$node" \
         ray start --address="$head_ip:6379" \
+            --node-ip-address "$worker_ip" \
             --num-gpus "$NUM_GPUS_PER_NODE" \
             --disable-usage-stats \
             --temp-dir "${RAY_TMPDIR:-/tmp/ray_$SLURM_JOB_ID}" \
